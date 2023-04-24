@@ -17,9 +17,10 @@ panic-probe = "0.3"
 defmt = "0.3"
 defmt-rtt = "0.4"
 
-heapless = "0.7"
+# might not need it, might also just need the heap lol
+# heapless = "0.7"
 
-aucpace = { git = "https://github.com/RustCrypto/PAKEs", rev = "237b48d", default-features = false, features = ["zeroize", "serde"] }
+aucpace = { git = "https://github.com/RustCrypto/PAKEs", rev = "237b48d", default-features = false, features = ["zeroize", "serde", "strong_aucpace", "partial_augmentation"] }
 rand_core = { version = "0.6.4", default-features = false }
 rand_chacha = { version = "0.3.1", default-features = false }
 serde = { version = "1.0", default-features = false }
@@ -27,13 +28,3 @@ postcard = { version = "1", default-features = false }
 sha2 = { version = "0.10", default-features = false }
 curve25519-dalek = { version = "4.0.0-rc.1", default-features = false }
 password-hash = { version = "0.5", default-features = false }
-
-[features]
-# Feature to use the Strong AuCPace protocol
-strong = ["aucpace/strong_aucpace"]
-# Feature to use the partially augmented version of the protocol
-partial = ["aucpace/partial_augmentation"]
-# Feature to use implicit authnetication
-implicit = []
-# Feature to use a static SSID
-static_ssid = []

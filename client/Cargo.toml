@@ -25,12 +25,5 @@ features = [
     "getrandom",
     "alloc",
     "serde",
+    "strong_aucpace"
 ]
-
-[features]
-# Feature to use the Strong AuCPace protocol
-strong = ["aucpace/strong_aucpace"]
-# Feature to use implicit authnetication
-implicit = []
-# Feature to use a static SSID
-static_ssid = []

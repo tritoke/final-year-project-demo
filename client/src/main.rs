@@ -16,17 +16,14 @@ const USART_BAUD: u32 = 28800;
 const RECV_BUF_LEN: usize = 1024;
 const K1: usize = 16;
 
-#[cfg(feature = "static_ssid")]
-const SSID: [u8; 32] = [
-    60, 173, 56, 252, 74, 141, 171, 146, 102, 169, 149, 169, 158, 106, 87, 232, 220, 141, 251, 73,
-    39, 130, 105, 184, 93, 87, 195, 23, 246, 158, 85, 226,
-];
-
 /// function like macro to wrap sending data over the serial port, returns the number of bytes sent
 macro_rules! send {
     ($serial_mtx:ident, $msg:ident) => {{
         let serialised = postcard::to_stdvec_cobs(&$msg).expect("Failed to serialise message");
-        trace!("Sending {} byte long message - {serialised:02X?}", serialised.len());
+        trace!(
+            "Sending {} byte long message - {serialised:02X?}",
+            serialised.len()
+        );
         $serial_mtx
             .lock()
             .expect("Failed to acquire serial port mutex")
@@ -126,38 +123,17 @@ fn main() -> Result<()> {
     let user = args.username.as_str();
     let pass = args.password.as_str();
     if !args.skip_register {
-        #[cfg(not(feature = "strong"))]
-        let message = base_client
-            .register_alloc(user.as_bytes(), pass, Params::recommended(), Scrypt)
-            .map_err(|e| anyhow!(e))?;
-
-        #[cfg(feature = "strong")]
         let message = base_client
             .register_alloc_strong(user.as_bytes(), pass, Params::recommended(), Scrypt)
             .map_err(|e| anyhow!(e))?;
 
         let _ = send!(serial, message);
-        info!(
-            "Registered as {user}:{pass} for {}",
-            if cfg!(feature = "strong") {
-                "Strong AuCPace"
-            } else {
-                "AuCPace"
-            }
-        );
+        info!("Registered {user} with StrongAuCPace");
     }
 
-    info!("Starting AuCPace");
+    info!("Starting StrongAuCPace");
     let start = Instant::now();
     // ===== SSID Establishment =====
-    #[cfg(feature = "static_ssid")]
-    let client = {
-        let client = base_client.begin_prestablished_ssid(SSID).unwrap();
-        info!("Began from static SSID={:02X?}", SSID);
-        client
-    };
-
-    #[cfg(not(feature = "static_ssid"))]
     let client = {
         let (client, message) = base_client.begin();
         bytes_sent += send!(serial, message);
@@ -173,12 +149,6 @@ fn main() -> Result<()> {
     };
 
     // ===== Augmentation Layer =====
-    #[cfg(not(feature = "strong"))]
-    let (client, message) = {
-        info!("Sending message: Username");
-        client.start_augmentation(user.as_bytes(), pass.as_bytes())
-    };
-    #[cfg(feature = "strong")]
     let (client, message) = {
         info!("Sending message: Strong Username");
         client.start_augmentation_strong(user.as_bytes(), pass.as_bytes(), &mut rand_core::OsRng)
@@ -186,24 +156,6 @@ fn main() -> Result<()> {
     bytes_sent += send!(serial, message);
 
     let mut server_message = recv!(receiver);
-    #[cfg(not(feature = "strong"))]
-    let client = if let ServerMessage::AugmentationInfo {
-        x_pub,
-        salt,
-        pbkdf_params,
-        ..
-    } = server_message
-    {
-        info!("Received Augmentation info");
-        let params = parse_params(pbkdf_params)?;
-        client
-            .generate_cpace_alloc(x_pub, &salt, params, Scrypt)
-            .expect("Failed to generate CPace step data")
-    } else {
-        panic!("Received invalid server message {:?}", server_message);
-    };
-
-    #[cfg(feature = "strong")]
     let client = if let ServerMessage::StrongAugmentationInfo {
         x_pub,
         blinded_salt,
@@ -230,11 +182,9 @@ fn main() -> Result<()> {
     let ServerMessage::PublicKey(server_pubkey) = server_message else {
         panic!("Received invalid server message {:?}", server_message);
     };
-    let key = if cfg!(feature = "implicit") {
-        client.implicit_auth(server_pubkey)
-            .map_err(|e| anyhow!(e))?
-    } else {
-        let (client, message) = client.receive_server_pubkey(server_pubkey)
+    let key = {
+        let (client, message) = client
+            .receive_server_pubkey(server_pubkey)
             .map_err(|e| anyhow!(e))?;
 
         // ===== Explicit Mutual Auth =====
