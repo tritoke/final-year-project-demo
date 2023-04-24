@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+
+members = [
+  "client",
+  "server",
+]
+
+[profile.release]
+debug = 2
+
+[profile.server]
+inherits = "release"
+opt-level = "s"
+lto = true
+codegen-units = 1
