@@ -1,15 +1,13 @@
 #![no_std]
 #![no_main]
-#![feature(type_alias_impl_trait, alloc_error_handler)]
+#![feature(type_alias_impl_trait)]
 
 mod database;
 mod msg_receiver;
 mod storage;
 
-use alloc_cortex_m::CortexMHeap;
 use aucpace::{AuCPaceServer, ClientMessage};
 use core::fmt::Write as _;
-use core::mem::MaybeUninit;
 use database::SingleUserDatabase;
 use defmt::*;
 use embassy_executor::Spawner;
@@ -22,18 +20,14 @@ use rand_core::SeedableRng;
 use {defmt_rtt as _, panic_probe as _};
 
 use crate::msg_receiver::MsgReceiver;
+use crate::storage::{Entry, Storage};
 use aucpace::PartialAugDatabase;
 use aucpace::StrongDatabase;
 use embassy_stm32::adc::Adc;
-use embassy_stm32::flash::{Flash, FLASH_SIZE};
+use embassy_stm32::flash::Flash;
 
+// AuCPace nonce-size constant
 const K1: usize = 16;
-
-#[global_allocator]
-static ALLOCATOR: CortexMHeap = CortexMHeap::empty();
-
-const HEAP_SIZE: usize = 1024;
-static mut HEAP: [MaybeUninit<u8>; HEAP_SIZE] = [MaybeUninit::uninit(); HEAP_SIZE];
 
 /// function like macro to wrap sending data over USART2, returns the number of bytes sent
 macro_rules! send {
@@ -71,10 +65,6 @@ async fn main(_spawner: Spawner) -> ! {
     board_config.rcc = rcc_config;
     let p = embassy_stm32::init(board_config);
     debug!("Initialised peripherals.");
-
-    // Initialize the allocator
-    unsafe { ALLOCATOR.init(HEAP.as_ptr() as usize, HEAP_SIZE) }
-    debug!("Initialised heap.");
 
     // configure USART2 which goes over the USB port on this board
     let mut config = Config::default();
@@ -252,20 +242,30 @@ async fn main(_spawner: Spawner) -> ! {
 
     debug!("Established strong shared key");
 
-    info!("Reading from flash:");
-    let mut flash = Flash::new(p.FLASH);
+    info!("Setting up flash storage");
+    let mut storage = unwrap!(Storage::new(Flash::new(p.FLASH)));
 
-    let mut buf = [0u8; 40];
-    let offset = FLASH_SIZE as u32 - 40;
-    unwrap!(flash.blocking_read(offset, &mut buf));
-    info!("Read 40 bytes from flash at offset {} - {:x}", offset, buf);
+    info!("storage.no_entries() = {}", storage.no_entries());
 
-    buf[0] = 0x69;
-    info!("Writing 40 bytes to flash at offset {} - {:x}", offset, buf);
-    unwrap!(flash.blocking_write(offset, &mut buf));
+    let e = Entry {
+        pwd_data: [b'A'; 128],
+        metadata: [b'B'; 128],
+    };
+    info!("Writing a new entry");
+    unwrap!(storage.add_entry(e));
+    info!("storage.no_entries() = {}", storage.no_entries());
 
-    unwrap!(flash.blocking_read(offset, &mut buf));
-    info!("Read 40 bytes from flash at offset {} - {:x}", offset, buf);
+    info!("Getting last entry");
+    let entry = unwrap!(storage.get_entry(0));
+    debug!("e = {}", e);
+    debug!("entry = {}", entry);
+    debug!("entry == e: {}", entry == e);
+    defmt::assert_eq!(e, entry);
+    info!("Getting entry succeeded");
+
+    info!("Deleting last entry");
+    unwrap!(storage.del_entry(0));
+    info!("storage.no_entries() = {}", storage.no_entries());
 
     loop {}
 }
@@ -287,7 +287,7 @@ pub mod tests {
         let mut correct = [0x69u8; 256];
         correct[128..].fill(0x42);
 
-        assert_eq!(ser, &correct);
+        assert_eq!(ser, correct);
     }
 
     #[test]
@@ -295,7 +295,7 @@ pub mod tests {
         let mut ser = [0xABu8; 256];
         ser[128..].fill(0xCD);
 
-        let deser = Entry::deserialize(&ser);
+        let deser = Entry::deserialize(ser);
         let correct = Entry {
             pwd_data: [0xAB; 128],
             metadata: [0xCD; 128],
