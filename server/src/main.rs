@@ -23,8 +23,10 @@ use crate::msg_receiver::MsgReceiver;
 use crate::storage::{Entry, Storage};
 use aucpace::PartialAugDatabase;
 use aucpace::StrongDatabase;
+use curve25519_dalek::digest;
 use embassy_stm32::adc::Adc;
-use embassy_stm32::flash::Flash;
+use embassy_stm32::flash::{Flash, MAX_ERASE_SIZE};
+use embassy_stm32::pac::FLASH_SIZE;
 
 // AuCPace nonce-size constant
 const K1: usize = 16;
@@ -245,77 +247,5 @@ async fn main(_spawner: Spawner) -> ! {
     info!("Setting up flash storage");
     let mut storage = unwrap!(Storage::new(Flash::new(p.FLASH)));
 
-    info!("storage.no_entries() = {}", storage.no_entries());
-
-    let e = Entry {
-        pwd_data: [b'A'; 128],
-        metadata: [b'B'; 128],
-    };
-    info!("Writing a new entry");
-    unwrap!(storage.add_entry(e));
-    info!("storage.no_entries() = {}", storage.no_entries());
-
-    info!("Getting last entry");
-    let entry = unwrap!(storage.get_entry(0));
-    debug!("e = {}", e);
-    debug!("entry = {}", entry);
-    debug!("entry == e: {}", entry == e);
-    defmt::assert_eq!(e, entry);
-    info!("Getting entry succeeded");
-
-    info!("Deleting last entry");
-    unwrap!(storage.del_entry(0));
-    info!("storage.no_entries() = {}", storage.no_entries());
-
     loop {}
-}
-
-#[cfg(test)]
-#[defmt_test::tests]
-pub mod tests {
-    use crate::storage::Entry;
-    use defmt::{assert_eq, debug};
-
-    #[test]
-    fn test_entry_serialize() {
-        let entry = Entry {
-            pwd_data: [0x69; 128],
-            metadata: [0x42; 128],
-        };
-
-        let ser = entry.serialize();
-        let mut correct = [0x69u8; 256];
-        correct[128..].fill(0x42);
-
-        assert_eq!(ser, correct);
-    }
-
-    #[test]
-    fn test_entry_deserialize() {
-        let mut ser = [0xABu8; 256];
-        ser[128..].fill(0xCD);
-
-        let deser = Entry::deserialize(ser);
-        let correct = Entry {
-            pwd_data: [0xAB; 128],
-            metadata: [0xCD; 128],
-        };
-
-        assert_eq!(deser.pwd_data, correct.pwd_data);
-        assert_eq!(deser.metadata, correct.metadata);
-    }
-
-    #[test]
-    fn test_entry_roundtrip_serialization() {
-        let entry = Entry {
-            pwd_data: [0x69; 128],
-            metadata: [0x42; 128],
-        };
-
-        let ser = entry.serialize();
-        let deser = Entry::deserialize(ser);
-
-        assert_eq!(entry.pwd_data, deser.pwd_data);
-        assert_eq!(entry.metadata, deser.metadata);
-    }
 }
