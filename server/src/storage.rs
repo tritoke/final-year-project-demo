@@ -11,6 +11,8 @@ const NONCE_SIZE: usize = 12;
 const POLY1305_HASH_SIZE: usize = 16;
 const ENCRYPTION_OVERHEAD: usize = NONCE_SIZE + POLY1305_HASH_SIZE;
 
+pub type StorageResult<T> = Result<T, StorageError>;
+
 // use one sector for passwords, to allow copying between sectors when flash needs to be erased
 pub const MAX_NO_PASSWORDS: u32 = MAX_ERASE_SIZE as u32 / mem::size_of::<Entry>() as u32;
 
@@ -51,6 +53,10 @@ impl SectorMetadata {
             populated: [0; 16],
             deleted: [0; 16],
         }
+    }
+
+    fn from_flash(flash: &mut Flash<'_>, last_sector: bool) -> Self {
+        todo!()
     }
 
     fn populate_cell(&mut self, mut cell: u16) {
@@ -112,13 +118,15 @@ impl SectorMetadata {
 }
 
 /// The struct which is serialised when being stored in flash
+/// Sector one refers to the last sector in the flash: 393216..=524288
+/// Sector two refers to the one before that: 262144..=393216
 pub struct Storage<'flash> {
     metadata: SectorMetadata,
     pub flash: Flash<'flash>,
 }
 
 impl<'flash> Storage<'flash> {
-    pub fn new(mut flash: Flash<'flash>) -> Result<Self, StorageError> {
+    pub fn new(mut flash: Flash<'flash>) -> StorageResult<Self> {
         let mut buf = [0u8; 4];
         flash.blocking_read(FLASH_SIZE as u32 - 4, &mut buf)?;
 
@@ -130,6 +138,25 @@ impl<'flash> Storage<'flash> {
         };
 
         Ok(storage)
+    }
+
+    fn is_sector_one_active(&mut self) -> StorageResult<bool> {
+        // read the first 256 byte of both sectors
+        const SECTOR_ONE_START: u32 = (FLASH_SIZE - MAX_ERASE_SIZE) as u32;
+        const SECTOR_TWO_START: u32 = (FLASH_SIZE - 2 * MAX_ERASE_SIZE) as u32;
+
+        let mut buf = [0u8; 256];
+        self.flash.blocking_read(SECTOR_ONE_START, &mut buf)?;
+        let sector_one_erased = buf.iter().all(|x| *x == 0xFF);
+
+        self.flash.blocking_read(SECTOR_TWO_START, &mut buf)?;
+        let sector_two_erased = buf.iter().all(|x| *x == 0xFF);
+
+        // sector two is only active if sector one is erased and sector two isn't
+        // the case when neither are erased is erroneous so just take sector 1 as active
+        let sector_one_active = !(sector_one_erased & !sector_two_erased);
+
+        Ok(sector_one_active)
     }
 
     const fn entry_to_offset(entry: u32) -> u32 {
