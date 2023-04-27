@@ -10,13 +10,11 @@ pub mod storage;
 
 use aucpace::AuCPaceServer;
 use auth::{establish_key, register_user};
-use core::fmt::Write as _;
 use defmt::*;
 use embassy_executor::Spawner;
 use embassy_stm32::interrupt;
 use embassy_stm32::time::Hertz;
 use embassy_stm32::usart::{Config, Uart};
-use embassy_time::{Delay, Instant};
 use rand_chacha::ChaCha8Rng;
 use rand_core::SeedableRng;
 use {defmt_rtt as _, panic_probe as _};
@@ -24,9 +22,7 @@ use {defmt_rtt as _, panic_probe as _};
 use crate::msg_receiver::MsgReceiver;
 use crate::seed_gen::SeedGenerator;
 use crate::storage::{Entry, Storage};
-use embassy_stm32::adc::Adc;
 use embassy_stm32::flash::Flash;
-use sha2::digest::Output;
 use sha2::Sha512;
 
 // AuCPace nonce-size constant
@@ -51,11 +47,9 @@ async fn main(_spawner: Spawner) -> ! {
         Uart::new(p.USART2, p.PA3, p.PA2, irq, p.DMA1_CH6, p.DMA1_CH5, config).split();
     debug!("Configured USART2.");
 
-    // configure the temperature sensor
-    let mut delay = Delay;
-    let mut adc = Adc::new(p.ADC1, &mut delay);
-    let mut seed_generator = SeedGenerator::new(adc);
-    debug!("Configured ADC.");
+    // configure the seed generator
+    let mut seed_generator = SeedGenerator::new(p.ADC1);
+    debug!("Configured Seed generator.");
 
     // setup the flash storage manager
     let mut storage = unwrap!(Storage::new(Flash::new(p.FLASH)));

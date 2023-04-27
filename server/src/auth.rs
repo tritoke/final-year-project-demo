@@ -1,5 +1,5 @@
 use crate::{database::SingleUserDatabase, msg_receiver::MsgReceiver, seed_gen::SeedGenerator, K1};
-use aucpace::{AuCPaceServer, ClientMessage, ServerMessage, StrongDatabase};
+use aucpace::{AuCPaceServer, ClientMessage, StrongDatabase};
 use defmt::{debug, error, info, trace, unwrap, warn, Debug2Format};
 use embassy_stm32::peripherals::{DMA1_CH6, USART2};
 use embassy_stm32::usart::UartTx;
@@ -20,7 +20,7 @@ macro_rules! send {
 macro_rules! recv {
     ($recvr:ident) => {
         loop {
-            let parsed = $recvr.recv_msg().await;
+            let parsed = $recvr.recv_msg::<ClientMessage<K1>>().await;
             match parsed {
                 Ok(msg) => {
                     trace!("Parsed message - {:?}", defmt::Debug2Format(&msg));

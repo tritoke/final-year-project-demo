@@ -1,10 +1,9 @@
-use aucpace::ClientMessage;
 use defmt::{trace, unwrap, warn};
 use embassy_stm32::peripherals;
 use embassy_stm32::usart::UartRx;
+use serde::Deserialize;
 
 const RECV_BUF_LEN: usize = 1024;
-use crate::K1;
 
 pub struct MsgReceiver<'uart> {
     buf: [u8; RECV_BUF_LEN],
@@ -23,7 +22,7 @@ impl<'uart> MsgReceiver<'uart> {
         }
     }
 
-    pub async fn recv_msg(&mut self) -> postcard::Result<ClientMessage<'_, K1>> {
+    pub async fn recv_msg<'a, T: Deserialize<'a>>(&'a mut self) -> postcard::Result<T> {
         // reset the state
         // copy all the data we read after the 0 byte to the start of the self.buffer
         if let Some(zi) = self.reset_pos {
@@ -87,6 +86,6 @@ impl<'uart> MsgReceiver<'uart> {
         self.reset_pos = Some(zi);
 
         // parse the result
-        postcard::from_bytes_cobs::<ClientMessage<K1>>(&mut self.buf[..=zi])
+        postcard::from_bytes_cobs(&mut self.buf[..=zi])
     }
 }

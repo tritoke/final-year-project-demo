@@ -1,6 +1,6 @@
 use embassy_stm32::adc::{Adc, Temperature};
 use embassy_stm32::peripherals::ADC1;
-use embassy_time::Instant;
+use embassy_time::{Delay, Instant};
 
 // an attempt at generating some entropy / non repeating values
 pub struct SeedGenerator<'adc> {
@@ -9,7 +9,8 @@ pub struct SeedGenerator<'adc> {
 }
 
 impl<'adc> SeedGenerator<'adc> {
-    pub fn new(adc: Adc<'adc, ADC1>) -> Self {
+    pub fn new(adc_peripheral: ADC1) -> Self {
+        let adc = Adc::new(adc_peripheral, &mut Delay);
         let temp_channel = adc.enable_temperature();
         Self { adc, temp_channel }
     }
