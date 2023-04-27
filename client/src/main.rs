@@ -110,7 +110,7 @@ fn main() -> Result<()> {
         .ok_or_else(|| anyhow!("Must supply a USB port."))?;
     let serial = Mutex::new({
         serialport::new(port_name, USART_BAUD)
-            .timeout(Duration::from_millis(500))
+            .timeout(Duration::from_secs(10))
             .open()?
     });
     let mut receiver = MsgReceiver::new(&serial);

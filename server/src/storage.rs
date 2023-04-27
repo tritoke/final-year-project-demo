@@ -5,6 +5,7 @@ use core::mem;
 use embassy_stm32::flash;
 use embassy_stm32::flash::{Error as FlashError, Flash, MAX_ERASE_SIZE};
 use embassy_stm32::pac::FLASH_SIZE;
+use rand_core::CryptoRngCore;
 use sha2::digest::generic_array::GenericArray;
 
 const PASSWORD_SIZE: usize = 40;
@@ -42,7 +43,7 @@ impl Entry {
 /// Struct for holding the metadata of what is stored and deleted
 /// does not enforce invariants, this is the responsbility of the user
 #[derive(defmt::Format)]
-struct SectorMetadata {
+pub struct SectorMetadata {
     populated: [u32; 16],
     deleted: [u32; 16],
 }
@@ -64,17 +65,21 @@ impl SectorMetadata {
     fn reset(&mut self) {
         self.populated.fill(0);
         self.deleted.fill(0);
+        self.set_active_sector(Sector::SectorOne);
     }
 
-    fn is_sector_one_active(&self) -> bool {
-        self.populated[15] >> 31 == 1
-    }
-
-    fn set_sector_one_active(&mut self, sector_one_active: bool) {
-        if sector_one_active {
-            self.populated[15] |= 1 << 31;
+    fn active_sector(&self) -> Sector {
+        if self.populated[15] >> 31 == 1 {
+            Sector::SectorOne
         } else {
-            self.populated[15] &= !(1 << 31);
+            Sector::SectorTwo
+        }
+    }
+
+    fn set_active_sector(&mut self, sector: Sector) {
+        match sector {
+            Sector::SectorOne => self.populated[15] |= 1 << 31,
+            Sector::SectorTwo => self.populated[15] &= !(1 << 31),
         }
     }
 
@@ -140,6 +145,28 @@ impl SectorMetadata {
     }
 }
 
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum Sector {
+    SectorOne,
+    SectorTwo,
+}
+
+impl Sector {
+    fn base_offset(&self) -> u32 {
+        match self {
+            Sector::SectorOne => (FLASH_SIZE - MAX_ERASE_SIZE) as u32,
+            Sector::SectorTwo => (FLASH_SIZE - MAX_ERASE_SIZE * 2) as u32,
+        }
+    }
+
+    fn db_offset(&self) -> u32 {
+        match self {
+            Sector::SectorOne => (FLASH_SIZE - 256) as u32,
+            Sector::SectorTwo => (FLASH_SIZE - MAX_ERASE_SIZE - 256) as u32,
+        }
+    }
+}
+
 /// The struct which is serialised when being stored in flash
 /// Sector one refers to the last sector in the flash: 393216..=524288
 /// Sector two refers to the one before that: 262144..=393216
@@ -149,13 +176,15 @@ pub struct Storage<'flash> {
 }
 
 impl<'flash> Storage<'flash> {
+    const KEY: [u8; 32] = const_random::const_random!([u8; 32]);
+
     pub fn new(mut flash: Flash<'flash>) -> StorageResult<Self> {
         let mut buf = [0u8; 4];
         flash.blocking_read(FLASH_SIZE as u32 - 4, &mut buf)?;
 
         let metadata = SectorMetadata::new();
         let mut storage = Self { metadata, flash };
-        storage.populate_metadata();
+        storage.populate_metadata()?;
 
         Ok(storage)
     }
@@ -175,15 +204,14 @@ impl<'flash> Storage<'flash> {
 
         // sector two is only active if sector one is erased and sector two isn't
         // the case when neither are erased is erroneous so just take sector 1 as active
-        let sector_one_active = !(sector_one_erased & !sector_two_erased);
-        self.metadata.set_sector_one_active(sector_one_active);
-
-        // the base offset of the sector
-        let sector_base = if sector_one_active {
-            FLASH_SIZE - MAX_ERASE_SIZE
+        let sector = if sector_one_erased & !sector_two_erased {
+            Sector::SectorTwo
         } else {
-            FLASH_SIZE - 2 * MAX_ERASE_SIZE
-        } as u32;
+            Sector::SectorOne
+        };
+        self.metadata.set_active_sector(sector);
+
+        let sector_base = sector.base_offset();
 
         // iterate through the sector until we read an 0xFF chunk
         let mut buf = [0u8; 256];
@@ -206,30 +234,29 @@ impl<'flash> Storage<'flash> {
         Ok(())
     }
 
-    // fn entry_to_offset(&self, entry: u32) -> u32 {
-    //     let sector_base = if self.metadata.is_sector_one_active() {
-    //         FLASH_SIZE - MAX_ERASE_SIZE
-    //     } else {
-    //         FLASH_SIZE - 2 * MAX_ERASE_SIZE
-    //     } as u32;
-    // }
+    pub fn erase_sector(&mut self, sector: Sector) -> StorageResult<()> {
+        let base = sector.base_offset();
+        self.flash
+            .blocking_erase(base, base + MAX_ERASE_SIZE as u32)?;
+        Ok(())
+    }
 
     // if there is no stored database then it returns a new - empty database
     pub fn retrieve_database(&mut self) -> StorageResult<SingleUserDatabase> {
-        let offset = if self.metadata.is_sector_one_active() {
-            FLASH_SIZE as u32 - 256
-        } else {
-            (FLASH_SIZE - MAX_ERASE_SIZE) as u32 - 256
-        };
+        let offset = self.metadata.active_sector().db_offset();
 
         let mut buf = [0u8; 256];
         self.flash.blocking_read(offset, &mut buf)?;
 
-        const KEY: [u8; 32] = const_random::const_random!([u8; 32]);
-        let cipher = ChaCha20Poly1305::new_from_slice(&KEY).expect("length invariant broken");
-        let nonce = GenericArray::from_slice(&buf[244..]);
+        let cipher = ChaCha20Poly1305::new_from_slice(&Self::KEY).expect("length invariant broken");
+        let (enc_data, tag_and_nonce) = buf.split_at_mut(228);
+        let nonce = GenericArray::from_slice(&tag_and_nonce[..12]).clone();
+        let tag = GenericArray::from_slice(&tag_and_nonce[12..]).clone();
 
-        if cipher.decrypt_in_place(nonce, b"", &mut buf[..244]).is_ok() {
+        if cipher
+            .decrypt_in_place_detached(&nonce, b"", &mut enc_data[..228], &tag)
+            .is_ok()
+        {
             defmt::info!("I am a decrypting wizard");
             let db = SingleUserDatabase::deserialise(
                 buf[..228].try_into().expect("length invariant broken"),
@@ -241,6 +268,42 @@ impl<'flash> Storage<'flash> {
             Ok(SingleUserDatabase::default())
         }
     }
+
+    pub fn store_database(
+        &mut self,
+        database: &SingleUserDatabase,
+        csprng: &mut impl CryptoRngCore,
+    ) -> StorageResult<()> {
+        let mut enc_data = database.serialise();
+        let cipher = ChaCha20Poly1305::new_from_slice(&Self::KEY).expect("length invariant broken");
+        let nonce = ChaCha20Poly1305::generate_nonce(csprng);
+        // from inspection of the chacha20poly1305 crate the only errors that can occur here are
+        // usize::try_into() -> u64, thus this should never panic, usize on this platform is 32 bits
+        let tag = cipher
+            .encrypt_in_place_detached(&nonce, b"", &mut enc_data)
+            .expect("usize magically grew bigger than u64?");
+
+        // if we are storing a database, any existing passsword data is meaningless
+        self.metadata.reset();
+        self.erase_sector(Sector::SectorOne)?;
+        self.erase_sector(Sector::SectorTwo)?;
+
+        // write the new database, encrypted data, then nonce, then tag
+        let offset = self.metadata.active_sector().db_offset();
+        self.flash.blocking_write(offset, &enc_data)?;
+        self.flash.blocking_write(offset + 228, &nonce)?;
+        self.flash.blocking_write(offset + 240, &tag)?;
+
+        Ok(())
+    }
+
+    // fn entry_to_offset(&self, entry: u32) -> u32 {
+    //     let sector_base = if self.metadata.is_sector_one_active() {
+    //         FLASH_SIZE - MAX_ERASE_SIZE
+    //     } else {
+    //         FLASH_SIZE - 2 * MAX_ERASE_SIZE
+    //     } as u32;
+    // }
 
     // pub fn add_entry(&mut self, entry: Entry) -> Result<(), StorageError> {
     //     // check we have space
@@ -462,11 +525,11 @@ pub mod tests {
     #[test]
     fn test_metadata_set_sector_one_active() {
         let mut metadata = SectorMetadata::new();
-        assert!(!metadata.is_sector_one_active());
+        assert!(!metadata.active_sector());
         metadata.set_sector_one_active(true);
-        assert!(metadata.is_sector_one_active());
+        assert!(metadata.active_sector());
         metadata.set_sector_one_active(false);
-        assert!(!metadata.is_sector_one_active());
+        assert!(!metadata.active_sector());
     }
 
     #[test]
