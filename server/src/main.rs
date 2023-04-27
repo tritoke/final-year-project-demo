@@ -2,6 +2,7 @@
 #![no_main]
 #![feature(type_alias_impl_trait)]
 
+mod auth;
 mod database;
 mod msg_receiver;
 mod storage;
@@ -13,7 +14,7 @@ use defmt::*;
 use embassy_executor::Spawner;
 use embassy_stm32::interrupt;
 use embassy_stm32::time::Hertz;
-use embassy_stm32::usart::{Config, Uart};
+use embassy_stm32::usart::{Config, Uart, UartTx};
 use embassy_time::{Delay, Instant};
 use rand_chacha::ChaCha8Rng;
 use rand_core::SeedableRng;
@@ -21,12 +22,14 @@ use {defmt_rtt as _, panic_probe as _};
 
 use crate::msg_receiver::MsgReceiver;
 use crate::storage::{Entry, Storage};
-use aucpace::PartialAugDatabase;
 use aucpace::StrongDatabase;
 use curve25519_dalek::digest;
-use embassy_stm32::adc::Adc;
+use embassy_stm32::adc::{Adc, Temperature};
 use embassy_stm32::flash::{Flash, MAX_ERASE_SIZE};
 use embassy_stm32::pac::FLASH_SIZE;
+use embassy_stm32::peripherals::{ADC1, DMA1_CH6, USART2};
+use sha2::digest::Output;
+use sha2::Sha512;
 
 // AuCPace nonce-size constant
 const K1: usize = 16;
@@ -34,7 +37,7 @@ const K1: usize = 16;
 /// function like macro to wrap sending data over USART2, returns the number of bytes sent
 macro_rules! send {
     ($tx:ident, $buf:ident, $msg:ident) => {{
-        let serialised = postcard::to_slice_cobs(&$msg, &mut $buf).unwrap();
+        let serialised = postcard::to_slice_cobs(&$msg, $buf).unwrap();
         unwrap!($tx.write(&serialised).await);
     }};
 }
@@ -79,29 +82,55 @@ async fn main(_spawner: Spawner) -> ! {
     // configure the temperature sensor
     let mut delay = Delay;
     let mut adc = Adc::new(p.ADC1, &mut delay);
-    let mut temp_channel = adc.enable_temperature();
+    let mut seed_generator = SeedGenerator::new(adc);
+    debug!("Configured ADC.");
+
+    let mut storage = unwrap!(Storage::new(Flash::new(p.FLASH)));
+    debug!("Set up storage: metadata = {}", storage.metadata);
 
     // configure the RNG, kind of insecure but this is just a demo and I don't have real entropy
-    let now = Instant::now().as_micros();
+    let now = Instant::now().as_ticks();
     // this needs converting but I'm just using it for entropy
-    let temp = adc.read_internal(&mut temp_channel);
-    let seed = now << 16 | temp as u64;
+    let seed = seed_generator.gen_seed();
     let server_rng = ChaCha8Rng::seed_from_u64(seed);
     debug!("Seeded RNG - seed = {}", seed);
 
     // create our AuCPace server
     let mut base_server: AuCPaceServer<sha2::Sha512, _, K1> = AuCPaceServer::new(server_rng);
-    let mut database: SingleUserDatabase<100> = SingleUserDatabase::default();
-    debug!("Created the Strong AuCPace Server and the Single User Database");
+    let mut database = unwrap!(storage.retrieve_database());
+    debug!("Created the Strong AuCPace Server and the retrieved the Single User Database");
 
     // create something to receive messages
     let mut buf = [0u8; 1024];
     let mut receiver = MsgReceiver::new(rx);
     debug!("Receiver and buffers set up");
 
+    if !database.is_populated() {
+        register_user(&mut database, &mut receiver, &mut tx, &mut buf);
+    }
+
+    let key = establish_key(
+        &mut base_server,
+        &database,
+        &mut seed_generator,
+        &mut receiver,
+        &mut tx,
+        &mut buf,
+    );
+    debug!("Established strong shared key");
+
+    loop {}
+}
+
+async fn register_user(
+    database: &mut SingleUserDatabase,
+    receiver: &mut MsgReceiver<'_>,
+    tx: &mut UartTx<'_, USART2, DMA1_CH6>,
+    buf: &mut [u8],
+) {
     // wait for a user to register themselves
-    debug!("Waiting for a registration packet.");
     let user = loop {
+        debug!("Waiting for a registration packet.");
         let msg = recv!(receiver);
 
         if let ClientMessage::StrongRegistration {
@@ -120,19 +149,20 @@ async fn main(_spawner: Spawner) -> ! {
             }
         }
     };
+}
 
-    let (priv_key, pub_key) = base_server.generate_long_term_keypair();
-    // it is fine to unwrap here because we have already registered
-    // a verifier for the user with store_verifier
-    database
-        .store_long_term_keypair(user, priv_key, pub_key)
-        .unwrap();
-    debug!("Stored a long term keypair for {:a}", user);
-
-    let _key = loop {
-        let start = Instant::now();
-        let mut session_rng = ChaCha8Rng::seed_from_u64(start.as_micros());
-        debug!("Seeded Session RNG - seed = {}", start.as_micros());
+async fn establish_key(
+    base_server: &mut AuCPaceServer<Sha512, ChaCha8Rng, K1>,
+    database: &SingleUserDatabase,
+    seed_generator: &mut SeedGenerator<'_>,
+    receiver: &mut MsgReceiver<'_>,
+    tx: &mut UartTx<'_, USART2, DMA1_CH6>,
+    buf: &mut [u8],
+) -> Output<Sha512> {
+    loop {
+        let seed = seed_generator.gen_seed();
+        let mut session_rng = ChaCha8Rng::seed_from_u64(seed);
+        debug!("Seeded Session RNG - seed = {}", seed);
 
         // now do a key-exchange
         debug!("Beginning AuCPace protocol");
@@ -162,31 +192,27 @@ async fn main(_spawner: Spawner) -> ! {
 
         // ===== Augmentation Layer =====
         let mut client_message = recv!(receiver);
-        let (server, message) =
-            if let ClientMessage::StrongUsername { username, blinded } = client_message {
-                let ret = server.generate_client_info_partial_strong(
-                    username,
-                    blinded,
-                    &database,
-                    &mut session_rng,
-                );
-                match ret {
-                    Ok(inner) => inner,
-                    Err(e) => {
-                        error!(
-                            "Receiving client Public Key returned an error {:?}",
-                            Debug2Format(&e)
-                        );
-                        continue;
-                    }
+        let (server, message) = if let ClientMessage::StrongUsername { username, blinded } =
+            client_message
+        {
+            match server.generate_client_info_strong(username, blinded, database, &mut session_rng)
+            {
+                Ok(inner) => inner,
+                Err(e) => {
+                    error!(
+                        "Receiving client Public Key returned an error {:?}",
+                        Debug2Format(&e)
+                    );
+                    continue;
                 }
-            } else {
-                error!(
-                    "Received invalid client message {:?} - restarting negotiation",
-                    Debug2Format(&client_message),
-                );
-                continue;
-            };
+            }
+        } else {
+            error!(
+                "Received invalid client message {:?} - restarting negotiation",
+                Debug2Format(&client_message),
+            );
+            continue;
+        };
 
         send!(tx, buf, message);
         debug!("Received Client Username and Blinded Point");
@@ -240,12 +266,24 @@ async fn main(_spawner: Spawner) -> ! {
         debug!("Sent Authenticator");
 
         break key;
-    };
+    }
+}
 
-    debug!("Established strong shared key");
+// an attempt at generating some entropy / non repeating values
+struct SeedGenerator<'adc> {
+    adc: Adc<'adc, ADC1>,
+    temp_channel: Temperature,
+}
 
-    info!("Setting up flash storage");
-    let mut storage = unwrap!(Storage::new(Flash::new(p.FLASH)));
+impl<'adc> SeedGenerator<'adc> {
+    fn new(mut adc: Adc<'adc, ADC1>) -> Self {
+        let mut temp_channel = adc.enable_temperature();
+        Self { adc, temp_channel }
+    }
 
-    loop {}
+    fn gen_seed(&mut self) -> u64 {
+        let now = Instant::now().as_ticks();
+        let temp = self.adc.read_internal(&mut self.temp_channel) as u64;
+        now ^ (temp << 48)
+    }
 }

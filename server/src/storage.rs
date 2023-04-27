@@ -1,7 +1,11 @@
+use crate::database::SingleUserDatabase;
+use chacha20poly1305::consts::U16;
+use chacha20poly1305::{AeadCore, AeadInPlace, ChaCha20Poly1305, KeyInit};
 use core::mem;
 use embassy_stm32::flash;
 use embassy_stm32::flash::{Error as FlashError, Flash, MAX_ERASE_SIZE};
 use embassy_stm32::pac::FLASH_SIZE;
+use sha2::digest::generic_array::GenericArray;
 
 const PASSWORD_SIZE: usize = 40;
 const USERNAME_SIZE: usize = 60;
@@ -10,11 +14,6 @@ const METADATA_SIZE: usize = 100;
 const NONCE_SIZE: usize = 12;
 const POLY1305_HASH_SIZE: usize = 16;
 const ENCRYPTION_OVERHEAD: usize = NONCE_SIZE + POLY1305_HASH_SIZE;
-
-pub type StorageResult<T> = Result<T, StorageError>;
-
-// use one sector for passwords, to allow copying between sectors when flash needs to be erased
-pub const MAX_NO_PASSWORDS: u32 = MAX_ERASE_SIZE as u32 / mem::size_of::<Entry>() as u32;
 
 /// The actual data of each entry (encrypted)
 #[repr(packed)]
@@ -42,12 +41,18 @@ impl Entry {
 
 /// Struct for holding the metadata of what is stored and deleted
 /// does not enforce invariants, this is the responsbility of the user
+#[derive(defmt::Format)]
 struct SectorMetadata {
     populated: [u32; 16],
     deleted: [u32; 16],
 }
 
+pub type StorageResult<T> = Result<T, StorageError>;
+
 impl SectorMetadata {
+    // 512 total cells, 1 cell reserved for password database for AuCPace
+    const MAX_CELL: u16 = 511;
+
     fn new() -> Self {
         Self {
             populated: [0; 16],
@@ -55,12 +60,26 @@ impl SectorMetadata {
         }
     }
 
-    fn from_flash(flash: &mut Flash<'_>, last_sector: bool) -> Self {
-        todo!()
+    /// reset all metadata state
+    fn reset(&mut self) {
+        self.populated.fill(0);
+        self.deleted.fill(0);
+    }
+
+    fn is_sector_one_active(&self) -> bool {
+        self.populated[15] >> 31 == 1
+    }
+
+    fn set_sector_one_active(&mut self, sector_one_active: bool) {
+        if sector_one_active {
+            self.populated[15] |= 1 << 31;
+        } else {
+            self.populated[15] &= !(1 << 31);
+        }
     }
 
     fn populate_cell(&mut self, mut cell: u16) {
-        if cell >= 512 {
+        if cell >= Self::MAX_CELL {
             return;
         }
 
@@ -75,7 +94,7 @@ impl SectorMetadata {
     }
 
     fn is_cell_populated(&self, mut cell: u16) -> bool {
-        if cell >= 512 {
+        if cell >= Self::MAX_CELL {
             return false;
         }
 
@@ -89,7 +108,7 @@ impl SectorMetadata {
     }
 
     fn delete_cell(&mut self, mut cell: u16) {
-        if cell >= 512 {
+        if cell >= Self::MAX_CELL {
             return;
         }
 
@@ -109,6 +128,10 @@ impl SectorMetadata {
             let taken_cells = self.deleted[i] | self.populated[i];
             if taken_cells != 0xFFFF_FFFF {
                 let first_free = taken_cells.trailing_ones();
+                // if we are in the last chunk and only the last one is free then
+                if i == 15 && first_free == 31 {
+                    return None;
+                }
                 return Some(i as u32 * 32 + first_free);
             }
         }
@@ -121,7 +144,7 @@ impl SectorMetadata {
 /// Sector one refers to the last sector in the flash: 393216..=524288
 /// Sector two refers to the one before that: 262144..=393216
 pub struct Storage<'flash> {
-    metadata: SectorMetadata,
+    pub metadata: SectorMetadata,
     pub flash: Flash<'flash>,
 }
 
@@ -130,17 +153,15 @@ impl<'flash> Storage<'flash> {
         let mut buf = [0u8; 4];
         flash.blocking_read(FLASH_SIZE as u32 - 4, &mut buf)?;
 
-        // TODO: actually populate the metadata
-
-        let mut storage = Self {
-            metadata: SectorMetadata::new(),
-            flash,
-        };
+        let metadata = SectorMetadata::new();
+        let mut storage = Self { metadata, flash };
+        storage.populate_metadata();
 
         Ok(storage)
     }
 
-    fn is_sector_one_active(&mut self) -> StorageResult<bool> {
+    fn populate_metadata(&mut self) -> StorageResult<()> {
+        // first determine which sector is active
         // read the first 256 byte of both sectors
         const SECTOR_ONE_START: u32 = (FLASH_SIZE - MAX_ERASE_SIZE) as u32;
         const SECTOR_TWO_START: u32 = (FLASH_SIZE - 2 * MAX_ERASE_SIZE) as u32;
@@ -155,12 +176,70 @@ impl<'flash> Storage<'flash> {
         // sector two is only active if sector one is erased and sector two isn't
         // the case when neither are erased is erroneous so just take sector 1 as active
         let sector_one_active = !(sector_one_erased & !sector_two_erased);
+        self.metadata.set_sector_one_active(sector_one_active);
 
-        Ok(sector_one_active)
+        // the base offset of the sector
+        let sector_base = if sector_one_active {
+            FLASH_SIZE - MAX_ERASE_SIZE
+        } else {
+            FLASH_SIZE - 2 * MAX_ERASE_SIZE
+        } as u32;
+
+        // iterate through the sector until we read an 0xFF chunk
+        let mut buf = [0u8; 256];
+        for entry in 0..511 {
+            self.flash
+                .blocking_read(sector_base + 256 * entry, &mut buf)?;
+
+            // we have hit the erased part of the sector, thus we can stop reading
+            if buf.iter().all(|x| *x == 0xFF) {
+                break;
+            } else if buf.iter().all(|x| *x == 0) {
+                // all zeros indicates a deletec cell
+                self.metadata.delete_cell(entry as u16);
+            } else {
+                // if its not FFFF.. or 0000.. then it is a populated cell
+                self.metadata.populate_cell(entry as u16);
+            }
+        }
+
+        Ok(())
     }
 
-    const fn entry_to_offset(entry: u32) -> u32 {
-        FLASH_SIZE as u32 - 4 - (entry + 1) * mem::size_of::<Entry>() as u32
+    // fn entry_to_offset(&self, entry: u32) -> u32 {
+    //     let sector_base = if self.metadata.is_sector_one_active() {
+    //         FLASH_SIZE - MAX_ERASE_SIZE
+    //     } else {
+    //         FLASH_SIZE - 2 * MAX_ERASE_SIZE
+    //     } as u32;
+    // }
+
+    // if there is no stored database then it returns a new - empty database
+    pub fn retrieve_database(&mut self) -> StorageResult<SingleUserDatabase> {
+        let offset = if self.metadata.is_sector_one_active() {
+            FLASH_SIZE as u32 - 256
+        } else {
+            (FLASH_SIZE - MAX_ERASE_SIZE) as u32 - 256
+        };
+
+        let mut buf = [0u8; 256];
+        self.flash.blocking_read(offset, &mut buf)?;
+
+        const KEY: [u8; 32] = const_random::const_random!([u8; 32]);
+        let cipher = ChaCha20Poly1305::new_from_slice(&KEY).expect("length invariant broken");
+        let nonce = GenericArray::from_slice(&buf[244..]);
+
+        if cipher.decrypt_in_place(nonce, b"", &mut buf[..244]).is_ok() {
+            defmt::info!("I am a decrypting wizard");
+            let db = SingleUserDatabase::deserialise(
+                buf[..228].try_into().expect("length invariant broken"),
+            );
+            defmt::info!("db.is_some() = {}", db.is_some());
+            Ok(db.unwrap_or_default())
+        } else {
+            defmt::info!("I am not a decrypting wizard");
+            Ok(SingleUserDatabase::default())
+        }
     }
 
     // pub fn add_entry(&mut self, entry: Entry) -> Result<(), StorageError> {
@@ -249,8 +328,14 @@ impl From<FlashError> for StorageError {
 #[cfg(test)]
 #[defmt_test::tests]
 pub mod tests {
-    use crate::storage::{Entry, SectorMetadata};
-    use defmt::{assert_eq, debug, warn};
+    use crate::database::SingleUserDatabase;
+    use crate::storage::{Entry, SectorMetadata, StorageResult};
+    use aucpace::StrongDatabase;
+    use curve25519_dalek::{RistrettoPoint, Scalar};
+    use defmt::{assert_eq, debug, info, warn, Debug2Format};
+    use password_hash::ParamsString;
+    use rand_chacha::ChaCha8Rng;
+    use rand_core::SeedableRng;
 
     #[test]
     fn test_entry_serialize() {
@@ -365,12 +450,52 @@ pub mod tests {
     #[test]
     fn test_metadata_next_unpopulated_when_full() {
         let mut metadata = SectorMetadata::new();
-        for x in 0..512 {
+        for x in 0..511 {
             metadata.populate_cell(x);
         }
         assert_eq!(metadata.next_unpopulated_cell(), None);
 
         metadata.delete_cell(1);
         assert_eq!(metadata.next_unpopulated_cell(), None);
+    }
+
+    #[test]
+    fn test_metadata_set_sector_one_active() {
+        let mut metadata = SectorMetadata::new();
+        assert!(!metadata.is_sector_one_active());
+        metadata.set_sector_one_active(true);
+        assert!(metadata.is_sector_one_active());
+        metadata.set_sector_one_active(false);
+        assert!(!metadata.is_sector_one_active());
+    }
+
+    #[test]
+    fn test_database_serialise_roundtrip() {
+        let mut csprng = ChaCha8Rng::seed_from_u64(0xDEADBEEF_CAFEBABE);
+        let mut database = SingleUserDatabase::default();
+
+        let username = b"tritoke";
+        let verifier = RistrettoPoint::random(&mut csprng);
+        let q = Scalar::random(&mut csprng);
+        let mut params = ParamsString::new();
+        if let Err(e) = params.add_str("id", "coolcrypt3") {
+            debug!("id: e = {}", Debug2Format(&e));
+        }
+        if let Err(e) = params.add_decimal("e", 69) {
+            debug!("e: e = {}", Debug2Format(&e));
+        }
+        if let Err(e) = params.add_decimal("k", 420) {
+            debug!("k: e = {}", Debug2Format(&e));
+        }
+
+        database.store_verifier_strong(b"tritoke", None, verifier, q, params.clone());
+
+        let ser = database.serialise();
+        let db = defmt::unwrap!(SingleUserDatabase::deserialise(ser));
+
+        let (vv, qq, pp) = defmt::unwrap!(db.lookup_verifier_strong(username));
+        assert!(vv == verifier);
+        assert!(qq == q);
+        assert!(pp == params);
     }
 }
