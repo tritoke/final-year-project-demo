@@ -1,8 +1,6 @@
 use crate::database::SingleUserDatabase;
-use chacha20poly1305::consts::U16;
 use chacha20poly1305::{AeadCore, AeadInPlace, ChaCha20Poly1305, KeyInit};
 use core::mem;
-use embassy_stm32::flash;
 use embassy_stm32::flash::{Error as FlashError, Flash, MAX_ERASE_SIZE};
 use embassy_stm32::pac::FLASH_SIZE;
 use rand_core::CryptoRngCore;
@@ -55,10 +53,12 @@ impl SectorMetadata {
     const MAX_CELL: u16 = 511;
 
     fn new() -> Self {
-        Self {
+        let mut metadata = Self {
             populated: [0; 16],
             deleted: [0; 16],
-        }
+        };
+        metadata.set_active_sector(Sector::SectorOne);
+        metadata
     }
 
     /// reset all metadata state
@@ -107,6 +107,8 @@ impl SectorMetadata {
             if cell < 32 {
                 return (self.populated[i] >> cell) & 1 == 1;
             }
+
+            cell -= 32;
         }
 
         false
@@ -234,7 +236,7 @@ impl<'flash> Storage<'flash> {
         Ok(())
     }
 
-    pub fn erase_sector(&mut self, sector: Sector) -> StorageResult<()> {
+    fn erase_sector(&mut self, sector: Sector) -> StorageResult<()> {
         let base = sector.base_offset();
         self.flash
             .blocking_erase(base, base + MAX_ERASE_SIZE as u32)?;
@@ -392,7 +394,7 @@ impl From<FlashError> for StorageError {
 #[defmt_test::tests]
 pub mod tests {
     use crate::database::SingleUserDatabase;
-    use crate::storage::{Entry, SectorMetadata, StorageResult};
+    use crate::storage::{Entry, Sector, SectorMetadata, StorageResult};
     use aucpace::StrongDatabase;
     use curve25519_dalek::{RistrettoPoint, Scalar};
     use defmt::{assert_eq, debug, info, warn, Debug2Format};
@@ -456,6 +458,7 @@ pub mod tests {
         let mut correct = [0u32; 16];
         correct[0] = 0x8000_0011;
         correct[1] = 0x8800_0001;
+        correct[15] |= 1 << 31;
 
         assert_eq!(metadata.populated, correct);
     }
@@ -478,6 +481,17 @@ pub mod tests {
     }
 
     #[test]
+    fn test_metadata_is_cell_populated() {
+        let mut metadata = SectorMetadata::new();
+        for x in 0..511 {
+            metadata.populate_cell(x);
+            assert!(metadata.is_cell_populated(x));
+            metadata.delete_cell(x);
+            assert!(!metadata.is_cell_populated(x));
+        }
+    }
+
+    #[test]
     fn test_metadata_populate_then_delete() {
         let mut metadata = SectorMetadata::new();
         metadata.populate_cell(0);
@@ -492,6 +506,7 @@ pub mod tests {
         let mut correct = [0u32; 16];
         correct[0] = 0x8000_0010;
         correct[1] = 0x0800_0001;
+        correct[15] |= 1 << 31;
 
         assert_eq!(metadata.populated, correct);
     }
@@ -525,11 +540,11 @@ pub mod tests {
     #[test]
     fn test_metadata_set_sector_one_active() {
         let mut metadata = SectorMetadata::new();
-        assert!(!metadata.active_sector());
-        metadata.set_sector_one_active(true);
-        assert!(metadata.active_sector());
-        metadata.set_sector_one_active(false);
-        assert!(!metadata.active_sector());
+        assert!(metadata.active_sector() == Sector::SectorOne);
+        metadata.set_active_sector(Sector::SectorTwo);
+        assert!(metadata.active_sector() == Sector::SectorTwo);
+        metadata.set_active_sector(Sector::SectorOne);
+        assert!(metadata.active_sector() == Sector::SectorOne);
     }
 
     #[test]
@@ -554,7 +569,7 @@ pub mod tests {
         database.store_verifier_strong(b"tritoke", None, verifier, q, params.clone());
 
         let ser = database.serialise();
-        let db = defmt::unwrap!(SingleUserDatabase::deserialise(ser));
+        let db = defmt::unwrap!(SingleUserDatabase::deserialise(&ser));
 
         let (vv, qq, pp) = defmt::unwrap!(db.lookup_verifier_strong(username));
         assert!(vv == verifier);

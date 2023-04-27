@@ -5,7 +5,6 @@ use curve25519_dalek::Scalar;
 
 use curve25519_dalek::RistrettoPoint;
 use password_hash::ParamsString;
-use sha2::digest::core_api::Buffer;
 
 pub const MAX_USERNAME_LEN: usize = 37;
 

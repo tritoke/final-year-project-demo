@@ -1,20 +1,42 @@
-use crate::{MsgReceiver, SeedGenerator, SingleUserDatabase, K1};
+use crate::{database::SingleUserDatabase, msg_receiver::MsgReceiver, seed_gen::SeedGenerator, K1};
 use aucpace::{AuCPaceServer, ClientMessage, ServerMessage, StrongDatabase};
-use defmt::{debug, error, info, trace, warn};
+use defmt::{debug, error, info, trace, unwrap, warn, Debug2Format};
 use embassy_stm32::peripherals::{DMA1_CH6, USART2};
 use embassy_stm32::usart::UartTx;
 use rand_chacha::ChaCha8Rng;
 use rand_core::SeedableRng;
+use sha2::digest::Output;
 use sha2::Sha512;
 
-async fn register_user(
-    database: &mut SingleUserDatabase,
-    receiver: &mut MsgReceiver<'_>,
-    tx: &mut UartTx<'_, USART2, DMA1_CH6>,
-    buf: &mut [u8],
-) {
+/// function like macro to wrap sending data over USART2, returns the number of bytes sent
+macro_rules! send {
+    ($tx:ident, $buf:ident, $msg:ident) => {{
+        let serialised = postcard::to_slice_cobs(&$msg, $buf).unwrap();
+        unwrap!($tx.write(&serialised).await);
+    }};
+}
+
+/// function like macro to wrap receiving data over USART2
+macro_rules! recv {
+    ($recvr:ident) => {
+        loop {
+            let parsed = $recvr.recv_msg().await;
+            match parsed {
+                Ok(msg) => {
+                    trace!("Parsed message - {:?}", defmt::Debug2Format(&msg));
+                    break msg;
+                }
+                Err(e) => {
+                    error!("Failed to parse message - {:?}", defmt::Debug2Format(&e));
+                }
+            };
+        }
+    };
+}
+
+pub async fn register_user(database: &mut SingleUserDatabase, receiver: &mut MsgReceiver<'_>) {
     // wait for a user to register themselves
-    let user = loop {
+    loop {
         debug!("Waiting for a registration packet.");
         let msg = recv!(receiver);
 
@@ -30,13 +52,15 @@ async fn register_user(
             } else {
                 database.store_verifier_strong(username, None, verifier, secret_exponent, params);
                 info!("Registered {:a} for Strong AuCPace", username);
-                break username;
+                break;
             }
+        } else {
+            warn!("Received invalid client message");
         }
-    };
+    }
 }
 
-async fn establish_key(
+pub async fn establish_key(
     base_server: &mut AuCPaceServer<Sha512, ChaCha8Rng, K1>,
     database: &SingleUserDatabase,
     seed_generator: &mut SeedGenerator<'_>,
