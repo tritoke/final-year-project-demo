@@ -1,12 +1,12 @@
-use crate::{database::SingleUserDatabase, msg_receiver::MsgReceiver, seed_gen::SeedGenerator, K1};
+use crate::{database::SingleUserDatabase, msg_receiver::MsgReceiver, K1};
 use aucpace::{AuCPaceServer, ClientMessage, StrongDatabase};
-use defmt::{debug, error, info, trace, unwrap, warn, Debug2Format};
+use chacha20poly1305::Key;
+use defmt::{debug, error, info, trace, unwrap};
 use embassy_stm32::peripherals::{DMA1_CH6, USART2};
 use embassy_stm32::usart::UartTx;
 use rand_chacha::ChaCha8Rng;
-use rand_core::SeedableRng;
-use sha2::digest::Output;
-use sha2::Sha512;
+use rand_core::CryptoRngCore;
+use sha3::Sha3_512;
 
 /// function like macro to wrap sending data over USART2, returns the number of bytes sent
 macro_rules! send {
@@ -54,126 +54,64 @@ pub async fn register_user(database: &mut SingleUserDatabase, receiver: &mut Msg
                 info!("Registered {:a} for Strong AuCPace", username);
                 break;
             }
-        } else {
-            warn!("Received invalid client message");
         }
     }
 }
 
 pub async fn establish_key(
-    base_server: &mut AuCPaceServer<Sha512, ChaCha8Rng, K1>,
+    base_server: &mut AuCPaceServer<Sha3_512, ChaCha8Rng, K1>,
     database: &SingleUserDatabase,
-    seed_generator: &mut SeedGenerator<'_>,
+    session_rng: &mut impl CryptoRngCore,
     receiver: &mut MsgReceiver<'_>,
     tx: &mut UartTx<'_, USART2, DMA1_CH6>,
     buf: &mut [u8],
-) -> Output<Sha512> {
-    loop {
-        let seed = seed_generator.gen_seed();
-        let mut session_rng = ChaCha8Rng::seed_from_u64(seed);
-        debug!("Seeded Session RNG - seed = {}", seed);
+) -> Option<chacha20poly1305::Key> {
+    // ===== SSID Establishment =====
+    debug!("Waiting for client Nonce");
+    let ClientMessage::Nonce(client_nonce) = recv!(receiver) else {
+        return None;
+    };
+    debug!("Received Client Nonce");
 
-        // now do a key-exchange
-        debug!("Beginning AuCPace protocol");
+    let (server, message) = base_server.begin();
+    send!(tx, buf, message);
+    debug!("Sent Nonce");
 
-        // ===== SSID Establishment =====
-        let server = {
-            let (server, message) = base_server.begin();
+    let server = server.agree_ssid(client_nonce);
 
-            let client_message: ClientMessage<K1> = recv!(receiver);
-            let server = if let ClientMessage::Nonce(client_nonce) = client_message {
-                server.agree_ssid(client_nonce)
-            } else {
-                error!(
-                    "Received invalid client message {:?} - restarting negotiation",
-                    defmt::Debug2Format(&client_message),
-                );
-                continue;
-            };
-            debug!("Received Client Nonce");
+    // ===== Augmentation Layer =====
+    let ClientMessage::StrongUsername { username, blinded } = recv!(receiver) else {
+        return None;
+    };
+    debug!("Received Client Username and Blinded Point");
 
-            // now that we have received the client nonce, send our nonce back
-            send!(tx, buf, message);
-            info!("Sent Nonce");
+    let (server, message) = server
+        .generate_client_info_strong(username, blinded, database, session_rng)
+        .ok()?;
+    send!(tx, buf, message);
+    debug!("Sent Strong Augmentation Info");
 
-            server
-        };
+    // ===== CPace substep =====
+    let ci = "Server-USART2-Client-SerialPort";
+    let (server, message) = server.generate_public_key(ci);
+    send!(tx, buf, message);
+    debug!("Sent PublicKey");
 
-        // ===== Augmentation Layer =====
-        let mut client_message = recv!(receiver);
-        let (server, message) = if let ClientMessage::StrongUsername { username, blinded } =
-            client_message
-        {
-            match server.generate_client_info_strong(username, blinded, database, &mut session_rng)
-            {
-                Ok(inner) => inner,
-                Err(e) => {
-                    error!(
-                        "Receiving client Public Key returned an error {:?}",
-                        Debug2Format(&e)
-                    );
-                    continue;
-                }
-            }
-        } else {
-            error!(
-                "Received invalid client message {:?} - restarting negotiation",
-                Debug2Format(&client_message),
-            );
-            continue;
-        };
+    let ClientMessage::PublicKey(client_pubkey) = recv!(receiver) else {
+        return None;
+    };
 
-        send!(tx, buf, message);
-        debug!("Received Client Username and Blinded Point");
-        debug!("Sent Strong Augmentation Info");
+    let server = server.receive_client_pubkey(client_pubkey).ok()?;
+    debug!("Received Client PublicKey");
 
-        // ===== CPace substep =====
-        let ci = "Server-USART2-Client-SerialPort";
-        let (server, message) = server.generate_public_key(ci);
-        send!(tx, buf, message);
-        debug!("Sent PublicKey");
+    // ===== Explicit Mutual Authentication =====
+    let ClientMessage::Authenticator(ca) = recv!(receiver) else {
+        return None;
+    };
+    let (key, message) = server.receive_client_authenticator(ca).ok()?;
+    send!(tx, buf, message);
+    debug!("Sent Authenticator");
 
-        client_message = recv!(receiver);
-        let ClientMessage::PublicKey(client_pubkey) = client_message else {
-            error!("Received invalid client message {:?}", Debug2Format(&client_message));
-            continue;
-        };
-
-        let server = match server.receive_client_pubkey(client_pubkey) {
-            Ok(s) => s,
-            Err(e) => {
-                error!(
-                    "Receiving client Public Key returned an error {:?}",
-                    Debug2Format(&e)
-                );
-                continue;
-            }
-        };
-        debug!("Received Client PublicKey");
-
-        // ===== Explicit Mutual Authentication =====
-        client_message = recv!(receiver);
-        let (key, message) = if let ClientMessage::Authenticator(ca) = client_message {
-            match server.receive_client_authenticator(ca) {
-                Ok(inner) => inner,
-                Err(e) => {
-                    error!(
-                        "Client failed the Explicit Mutual Authentication check - {:?}",
-                        Debug2Format(&e)
-                    );
-                    continue;
-                }
-            }
-        } else {
-            error!(
-                "Received invalid client message {:?}",
-                Debug2Format(&client_message)
-            );
-            continue;
-        };
-        send!(tx, buf, message);
-        debug!("Sent Authenticator");
-
-        break key;
-    }
+    // take the first 16 bytes of the hash as the key
+    Some(Key::from_slice(&key.as_slice()[..32]).clone())
 }

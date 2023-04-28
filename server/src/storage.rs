@@ -1,10 +1,11 @@
 use crate::database::SingleUserDatabase;
+use crate::DB_ENC_KEY;
 use chacha20poly1305::{AeadCore, AeadInPlace, ChaCha20Poly1305, KeyInit};
 use core::mem;
 use embassy_stm32::flash::{Error as FlashError, Flash, MAX_ERASE_SIZE};
 use embassy_stm32::pac::FLASH_SIZE;
 use rand_core::CryptoRngCore;
-use sha2::digest::generic_array::GenericArray;
+use sha3::digest::generic_array::GenericArray;
 
 const PASSWORD_SIZE: usize = 40;
 const USERNAME_SIZE: usize = 60;
@@ -48,6 +49,7 @@ pub struct SectorMetadata {
 
 pub type StorageResult<T> = Result<T, StorageError>;
 
+#[allow(unused)]
 impl SectorMetadata {
     // 512 total cells, 1 cell reserved for password database for AuCPace
     const MAX_CELL: u16 = 511;
@@ -130,6 +132,22 @@ impl SectorMetadata {
         }
     }
 
+    fn is_cell_deleted(&self, mut cell: u16) -> bool {
+        if cell >= Self::MAX_CELL {
+            return false;
+        }
+
+        for i in 0..16 {
+            if cell < 32 {
+                return (self.deleted[i] >> cell) & 1 == 1;
+            }
+
+            cell -= 32;
+        }
+
+        false
+    }
+
     fn next_unpopulated_cell(&self) -> Option<u32> {
         for i in 0..16 {
             let taken_cells = self.deleted[i] | self.populated[i];
@@ -145,9 +163,13 @@ impl SectorMetadata {
 
         None
     }
+
+    fn num_deleted_entries(&self) -> u32 {
+        self.deleted.iter().fold(0, |acc, x| acc + x.count_ones())
+    }
 }
 
-#[derive(Copy, Clone, Eq, PartialEq)]
+#[derive(Copy, Clone, Eq, PartialEq, defmt::Format)]
 enum Sector {
     SectorOne,
     SectorTwo,
@@ -167,6 +189,11 @@ impl Sector {
             Sector::SectorTwo => (FLASH_SIZE - MAX_ERASE_SIZE - 256) as u32,
         }
     }
+
+    fn entry_offset(&self, entry: u32) -> u32 {
+        let base = self.base_offset();
+        base + entry * 256
+    }
 }
 
 /// The struct which is serialised when being stored in flash
@@ -178,8 +205,6 @@ pub struct Storage<'flash> {
 }
 
 impl<'flash> Storage<'flash> {
-    const KEY: [u8; 32] = const_random::const_random!([u8; 32]);
-
     pub fn new(mut flash: Flash<'flash>) -> StorageResult<Self> {
         let mut buf = [0u8; 4];
         flash.blocking_read(FLASH_SIZE as u32 - 4, &mut buf)?;
@@ -217,19 +242,19 @@ impl<'flash> Storage<'flash> {
 
         // iterate through the sector until we read an 0xFF chunk
         let mut buf = [0u8; 256];
-        for entry in 0..511 {
+        for entry in 0..SectorMetadata::MAX_CELL {
             self.flash
-                .blocking_read(sector_base + 256 * entry, &mut buf)?;
+                .blocking_read(sector_base + 256 * entry as u32, &mut buf)?;
 
             // we have hit the erased part of the sector, thus we can stop reading
             if buf.iter().all(|x| *x == 0xFF) {
                 break;
             } else if buf.iter().all(|x| *x == 0) {
                 // all zeros indicates a deletec cell
-                self.metadata.delete_cell(entry as u16);
+                self.metadata.delete_cell(entry);
             } else {
                 // if its not FFFF.. or 0000.. then it is a populated cell
-                self.metadata.populate_cell(entry as u16);
+                self.metadata.populate_cell(entry);
             }
         }
 
@@ -250,7 +275,8 @@ impl<'flash> Storage<'flash> {
         let mut buf = [0u8; 256];
         self.flash.blocking_read(offset, &mut buf)?;
 
-        let cipher = ChaCha20Poly1305::new_from_slice(&Self::KEY).expect("length invariant broken");
+        let cipher =
+            ChaCha20Poly1305::new_from_slice(&DB_ENC_KEY).expect("length invariant broken");
         let (enc_data, tag_and_nonce) = buf.split_at_mut(228);
         let nonce = GenericArray::from_slice(&tag_and_nonce[..12]).clone();
         let tag = GenericArray::from_slice(&tag_and_nonce[12..]).clone();
@@ -259,14 +285,13 @@ impl<'flash> Storage<'flash> {
             .decrypt_in_place_detached(&nonce, b"", &mut enc_data[..228], &tag)
             .is_ok()
         {
-            defmt::info!("I am a decrypting wizard");
+            defmt::info!("Successfully retrieved database from flash");
             let db = SingleUserDatabase::deserialise(
                 buf[..228].try_into().expect("length invariant broken"),
             );
-            defmt::info!("db.is_some() = {}", db.is_some());
             Ok(db.unwrap_or_default())
         } else {
-            defmt::info!("I am not a decrypting wizard");
+            defmt::info!("Failed to retrieve database from flash");
             Ok(SingleUserDatabase::default())
         }
     }
@@ -277,7 +302,8 @@ impl<'flash> Storage<'flash> {
         csprng: &mut impl CryptoRngCore,
     ) -> StorageResult<()> {
         let mut enc_data = database.serialise();
-        let cipher = ChaCha20Poly1305::new_from_slice(&Self::KEY).expect("length invariant broken");
+        let cipher =
+            ChaCha20Poly1305::new_from_slice(&DB_ENC_KEY).expect("length invariant broken");
         let nonce = ChaCha20Poly1305::generate_nonce(csprng);
         // from inspection of the chacha20poly1305 crate the only errors that can occur here are
         // usize::try_into() -> u64, thus this should never panic, usize on this platform is 32 bits
@@ -299,82 +325,112 @@ impl<'flash> Storage<'flash> {
         Ok(())
     }
 
-    // fn entry_to_offset(&self, entry: u32) -> u32 {
-    //     let sector_base = if self.metadata.is_sector_one_active() {
-    //         FLASH_SIZE - MAX_ERASE_SIZE
-    //     } else {
-    //         FLASH_SIZE - 2 * MAX_ERASE_SIZE
-    //     } as u32;
-    // }
+    // swap which sector is active and move across all entries
+    // returns the index of the next free entry after migration
+    fn migrate_sectors(&mut self) -> StorageResult<u32> {
+        // a core invariant is that one sector is always erased
+        let old_sector = self.metadata.active_sector();
+        let new_sector = match old_sector {
+            Sector::SectorOne => Sector::SectorTwo,
+            Sector::SectorTwo => Sector::SectorOne,
+        };
+        self.metadata.set_active_sector(new_sector);
 
-    // pub fn add_entry(&mut self, entry: Entry) -> Result<(), StorageError> {
-    //     // check we have space
-    //     if self.no_entries >= MAX_NO_PASSWORDS {
-    //         return Err(StorageError::MaxPasswordsStored);
-    //     }
+        // migrate the populated entries across
+        let mut buf = [0u8; 256];
+        let mut write_idx = 0;
+        for entry in 0..SectorMetadata::MAX_CELL {
+            // ignore unpopulated entries
+            if !self.metadata.is_cell_populated(entry as u16) {
+                continue;
+            }
 
-    //     // calculate the offset then store to flash, incrementing after a successful store
-    //     let offset = Self::entry_to_offset(self.no_entries);
-    //     defmt::debug!("offset = {}", offset);
-    //     let bytes = entry.serialize();
-    //     defmt::debug!("bytes = {:x}", bytes);
-    //     self.flash.blocking_write(offset, &bytes)?;
-    //     self.update_no_entries(self.no_entries + 1)?;
+            let write_offset = new_sector.entry_offset(write_idx);
+            self.flash.blocking_write(write_offset, &mut buf)?;
+            write_idx += 1;
+        }
 
-    //     Ok(())
-    // }
+        // migrate the database across
+        self.flash.blocking_read(old_sector.db_offset(), &mut buf)?;
+        self.flash.blocking_write(new_sector.db_offset(), &buf)?;
 
-    // pub fn get_entry(&mut self, entry_idx: u32) -> Result<Entry, StorageError> {
-    //     // check the entry is in bounds
-    //     if entry_idx >= self.no_entries {
-    //         return Err(StorageError::NonExistentEntry);
-    //     }
+        // maintain the one sector erased invariant
+        self.erase_sector(old_sector)?;
 
-    //     // calculate the offset then store to flash, incrementing after a successful store
-    //     let offset = Self::entry_to_offset(entry_idx);
-    //     defmt::debug!("offset = {}", offset);
-    //     let mut buffer = [0u8; 256];
-    //     self.flash.blocking_read(offset, &mut buffer)?;
-    //     defmt::debug!("buffer = {:x}", buffer);
+        // return the index of the first free
+        Ok(write_idx)
+    }
 
-    //     Ok(Entry::deserialize(buffer))
-    // }
+    // add an entry, returning the index it was stored at
+    pub fn add_entry(&mut self, entry: Entry) -> Result<u32, StorageError> {
+        // check we have space
+        let next_free = if let Some(next) = self.metadata.next_unpopulated_cell() {
+            next
+        } else if self.metadata.num_deleted_entries() > 0 {
+            self.migrate_sectors()?
+        } else {
+            return Err(StorageError::MaxPasswordsStored);
+        };
 
-    // pub fn del_entry(&mut self, entry_idx: u32) -> Result<(), StorageError> {
-    //     // check the entry is in bounds
-    //     if entry_idx >= self.no_entries {
-    //         return Err(StorageError::NonExistentEntry);
-    //     }
+        // calculate the offset then store to flash, incrementing after a successful store
+        let sector = self.metadata.active_sector();
+        let offset = sector.entry_offset(next_free);
+        let bytes = entry.serialize();
+        self.flash.blocking_write(offset, &bytes)?;
+        self.metadata.populate_cell(next_free as u16);
 
-    //     // to perform a deletion we swap the entry to be deleted with the last one
-    //     // if it is the last one then write data over the top
-    //     if entry_idx == self.no_entries - 1 {
-    //         // to overwrite the last entry:
-    //         // 1. decrement the number of entries
-    //         // 2. add another dummy entry to overwrite the old data
-    //         // 3. decrement the number of entries again to leave
-    //         self.no_entries -= 1;
-    //         self.add_entry(Entry::deserialize([b'A'; 256]))?;
-    //     } else {
-    //         let last_entry = self.get_entry(self.no_entries - 1)?;
+        Ok(next_free)
+    }
 
-    //         // now overwrite with the last entry
-    //         let offset = Self::entry_to_offset(entry_idx);
-    //         self.flash.blocking_write(offset, &last_entry.serialize())?;
-    //     }
+    pub fn get_entry(&mut self, entry_idx: u32) -> Result<Entry, StorageError> {
+        // check the entry is in bounds
+        if entry_idx >= SectorMetadata::MAX_CELL as u32 {
+            return Err(StorageError::NonExistentEntry);
+        }
 
-    //     // after all operations were successful decrement the number of entries
-    //     self.update_no_entries(self.no_entries - 1)?;
+        if self.metadata.is_cell_deleted(entry_idx as u16) {
+            return Err(StorageError::DeletedEntry);
+        }
 
-    //     Ok(())
-    // }
+        if !self.metadata.is_cell_populated(entry_idx as u16) {
+            return Err(StorageError::UnpopulatedEntry);
+        }
 
-    // fn update_no_entries(&mut self, no_entries: u32) -> Result<(), StorageError> {
-    //     let buf = no_entries.to_be_bytes();
-    //     self.flash.blocking_write(FLASH_SIZE as u32 - 4, &buf)?;
-    //     self.no_entries = no_entries;
-    //     Ok(())
-    // }
+        // retrieve the entry
+        let sector = self.metadata.active_sector();
+        let offset = sector.entry_offset(entry_idx);
+        let mut buffer = [0u8; 256];
+        self.flash.blocking_read(offset, &mut buffer)?;
+
+        Ok(Entry::deserialize(buffer))
+    }
+
+    pub fn update_entry(&mut self, entry_idx: u32, entry: Entry) -> Result<u32, StorageError> {
+        self.del_entry(entry_idx)?;
+        self.add_entry(entry)
+    }
+
+    pub fn del_entry(&mut self, entry_idx: u32) -> Result<(), StorageError> {
+        // check the entry is in bounds
+        if entry_idx >= SectorMetadata::MAX_CELL as u32 {
+            return Err(StorageError::NonExistentEntry);
+        }
+
+        if self.metadata.is_cell_deleted(entry_idx as u16) {
+            return Ok(());
+        } else if !self.metadata.is_cell_populated(entry_idx as u16) {
+            // if cell is neither populated nor deleted then it cannot be deleted
+            return Err(StorageError::UnpopulatedEntry);
+        }
+
+        // overwrite with zeros - flash supports only writing with zeros as a second write
+        let sector = self.metadata.active_sector();
+        let offset = sector.entry_offset(entry_idx);
+        self.metadata.delete_cell(entry_idx as u16);
+        self.flash.blocking_write(offset, &[0u8; 256])?;
+
+        Ok(())
+    }
 }
 
 #[derive(defmt::Format)]
@@ -382,6 +438,8 @@ pub enum StorageError {
     FlashError(FlashError),
     MaxPasswordsStored,
     NonExistentEntry,
+    DeletedEntry,
+    UnpopulatedEntry,
 }
 
 impl From<FlashError> for StorageError {
@@ -483,11 +541,23 @@ pub mod tests {
     #[test]
     fn test_metadata_is_cell_populated() {
         let mut metadata = SectorMetadata::new();
-        for x in 0..511 {
+        for x in 0..SectorMetadata::MAX_CELL {
             metadata.populate_cell(x);
             assert!(metadata.is_cell_populated(x));
             metadata.delete_cell(x);
             assert!(!metadata.is_cell_populated(x));
+        }
+    }
+
+    #[test]
+    fn test_metadata_is_cell_deleted() {
+        let mut metadata = SectorMetadata::new();
+        for x in 0..SectorMetadata::MAX_CELL {
+            assert!(!metadata.is_cell_deleted(x));
+            metadata.populate_cell(x);
+            assert!(!metadata.is_cell_deleted(x));
+            metadata.delete_cell(x);
+            assert!(metadata.is_cell_deleted(x));
         }
     }
 
@@ -528,7 +598,7 @@ pub mod tests {
     #[test]
     fn test_metadata_next_unpopulated_when_full() {
         let mut metadata = SectorMetadata::new();
-        for x in 0..511 {
+        for x in 0..SectorMetadata::MAX_CELL {
             metadata.populate_cell(x);
         }
         assert_eq!(metadata.next_unpopulated_cell(), None);

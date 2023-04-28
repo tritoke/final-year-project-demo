@@ -1,0 +1,12 @@
+[package]
+name = "shared"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"], default-features = false }
+chacha20poly1305 =  { version = "0.10", default-features = false, features = ["rand_core"] }
+rand_core = { version = "0.6.4", default-features = false }
+serde-byte-array = "0.1.2"
