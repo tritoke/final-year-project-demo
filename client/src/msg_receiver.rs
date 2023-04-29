@@ -1,5 +1,6 @@
 use crate::{K1, RECV_BUF_LEN};
 use aucpace::ServerMessage;
+use serde::Deserialize;
 use serialport::SerialPort;
 use std::sync::Mutex;
 use tracing::{trace, warn};
@@ -21,7 +22,7 @@ impl<'mtx> MsgReceiver<'mtx> {
         }
     }
 
-    pub fn recv_msg(&mut self) -> postcard::Result<ServerMessage<'_, K1>> {
+    pub fn recv_msg<'a, T: Deserialize<'a>>(&'a mut self) -> postcard::Result<T> {
         // reset the state
         // copy all the data we read after the 0 byte to the start of the self.buffer
         if let Some(zi) = self.reset_pos {
@@ -73,7 +74,7 @@ impl<'mtx> MsgReceiver<'mtx> {
 
             self.reset_pos = Some(zi);
             // parse the result
-            break postcard::from_bytes_cobs::<ServerMessage<K1>>(&mut self.buf[..=zi]);
+            break postcard::from_bytes_cobs(&mut self.buf[..=zi]);
         }
     }
 }

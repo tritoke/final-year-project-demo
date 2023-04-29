@@ -17,9 +17,10 @@ pub enum Action {
     Read {
         entry_idx: u32,
     },
-    ReadMetadata {
+    ReadEntryMetadata {
         entry_idx: u32,
     },
+    ReadSectorMetadata,
     Update {
         entry_idx: u32,
         #[serde(with = "serde_byte_array")]
@@ -52,7 +53,7 @@ pub enum Response {
     NewEntry {
         index: u32,
     },
-    Metadata {
+    SectorMetadata {
         #[serde(with = "serde_byte_array")]
         populated: [u8; 64],
     },
