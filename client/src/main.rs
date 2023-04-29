@@ -50,6 +50,7 @@ struct Args {
     #[arg(long, short)]
     username: String,
 
+    // TODO: replace this with rpassword when stuff actually works
     /// The Password to perform the exchange with
     #[arg(long, short)]
     password: String,

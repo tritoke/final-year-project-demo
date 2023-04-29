@@ -4,6 +4,7 @@ use chacha20poly1305::aead::generic_array::GenericArray;
 use chacha20poly1305::{AeadCore, AeadInPlace, ChaCha20Poly1305, Key, KeyInit};
 use rand_core::CryptoRngCore;
 use serde::{Deserialize, Serialize};
+use subtle::{Choice, ConstantTimeEq};
 
 // present a CRUD interface to the client
 #[derive(Serialize, Deserialize, Debug)]
@@ -36,7 +37,7 @@ pub enum Action {
 }
 
 /// used to grant an action - this prevents replay attacks
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Copy, Clone)]
 pub struct ActionToken(#[serde(with = "serde_byte_array")] [u8; 16]);
 
 impl ActionToken {
@@ -44,6 +45,12 @@ impl ActionToken {
         let mut s = Self([0u8; 16]);
         csprng.fill_bytes(&mut s.0);
         s
+    }
+}
+
+impl ConstantTimeEq for ActionToken {
+    fn ct_eq(&self, other: &Self) -> Choice {
+        self.0.ct_eq(&other.0)
     }
 }
 
@@ -67,6 +74,7 @@ pub enum Response {
         #[serde(with = "serde_byte_array")]
         metadata: [u8; 128],
     },
+    FlashError,
 }
 
 #[derive(Serialize, Deserialize, Debug)]

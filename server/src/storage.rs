@@ -63,6 +63,10 @@ impl SectorMetadata {
         metadata
     }
 
+    pub fn populated(&self) -> [u8; 64] {
+        unsafe { mem::transmute(self.populated) }
+    }
+
     /// reset all metadata state
     fn reset(&mut self) {
         self.populated.fill(0);
@@ -405,6 +409,29 @@ impl<'flash> Storage<'flash> {
         Ok(Entry::deserialize(buffer))
     }
 
+    pub fn get_metadata(&mut self, entry_idx: u32) -> Result<[u8; 128], StorageError> {
+        // check the entry is in bounds
+        if entry_idx >= SectorMetadata::MAX_CELL as u32 {
+            return Err(StorageError::NonExistentEntry);
+        }
+
+        if self.metadata.is_cell_deleted(entry_idx as u16) {
+            return Err(StorageError::DeletedEntry);
+        }
+
+        if !self.metadata.is_cell_populated(entry_idx as u16) {
+            return Err(StorageError::UnpopulatedEntry);
+        }
+
+        // retrieve the entry
+        let sector = self.metadata.active_sector();
+        let offset = sector.entry_offset(entry_idx) + 128;
+        let mut buffer = [0u8; 128];
+        self.flash.blocking_read(offset, &mut buffer)?;
+
+        Ok(buffer)
+    }
+
     pub fn update_entry(&mut self, entry_idx: u32, entry: Entry) -> Result<u32, StorageError> {
         self.del_entry(entry_idx)?;
         self.add_entry(entry)
@@ -429,6 +456,13 @@ impl<'flash> Storage<'flash> {
         self.metadata.delete_cell(entry_idx as u16);
         self.flash.blocking_write(offset, &[0u8; 256])?;
 
+        Ok(())
+    }
+
+    pub fn the_nsa_are_here(&mut self) -> Result<(), StorageError> {
+        self.erase_sector(Sector::SectorOne)?;
+        self.erase_sector(Sector::SectorTwo)?;
+        self.metadata.reset();
         Ok(())
     }
 }
