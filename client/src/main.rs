@@ -1,9 +1,10 @@
 mod auth;
+mod gui;
 mod msg_receiver;
 
 use anyhow::{anyhow, bail, Result};
 use aucpace::{AuCPaceClient, ServerMessage};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use rand_core::OsRng;
 use scrypt::password_hash::ParamsString;
 use scrypt::{Params, Scrypt};
@@ -16,10 +17,12 @@ use std::time::Duration;
 use std::{io, thread};
 
 use crate::auth::{establish_key, register_user};
+use crate::gui::Gui;
 use crate::msg_receiver::MsgReceiver;
 use shared::{Action, ActionToken, EncryptedMessage, Message, Response};
 #[allow(unused)]
 use tracing::{debug, error, info, trace, warn};
+use tracing_subscriber::fmt::writer::MakeWriterExt;
 
 const USART_BAUD: u32 = 28800;
 const RECV_BUF_LEN: usize = 1024;
@@ -29,57 +32,67 @@ type Client = AuCPaceClient<Sha3_512, Scrypt, OsRng, K1>;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
+#[command(propagate_version = true)]
 struct Args {
-    /// Name of the USB port to open
-    #[arg(long)]
-    port: Option<String>,
-
-    /// List USB ports on the system
-    #[arg(long)]
-    list_ports: bool,
-
     /// The maximum log level
     #[arg(long, default_value_t = tracing::Level::INFO)]
     log_level: tracing::Level,
 
-    /// Perform registration before AuCPace
+    /// Enable debug logging to stderr
     #[arg(long)]
-    register: bool,
+    debug_stderr: bool,
 
-    /// The Username to perform the exchange with
-    #[arg(long, short)]
-    username: String,
+    /// Enable debug logging to a file
+    #[arg(long)]
+    debug_file: bool,
 
-    // TODO: replace this with rpassword when stuff actually works
-    /// The Password to perform the exchange with
-    #[arg(long, short)]
-    password: String,
+    /// Use ANSI terminal colour codes to colour the output
+    #[arg(short = 'C', long = "colour")]
+    colour_output: bool,
 }
 
 fn main() -> Result<()> {
     let args = Args::try_parse()?;
 
-    // setup the logger
-    tracing_subscriber::fmt()
-        .with_ansi(true)
-        .with_max_level(args.log_level)
-        .with_writer(io::stderr)
-        .init();
+    // initialise logging
+    let log_file_name = format!("{}.log", env!("CARGO_PKG_NAME"));
+
+    // silly let thing is so that the log file doesn't ✨ disappear ✨
+    let _guard = if args.debug_file || args.debug_stderr {
+        let sub = tracing_subscriber::fmt()
+            .with_ansi(args.colour_output)
+            .with_max_level(args.log_level)
+            .with_thread_names(true);
+
+        if args.debug_file {
+            let file_appender = tracing_appender::rolling::never(".", log_file_name);
+            let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+
+            if args.debug_stderr {
+                sub.with_writer(non_blocking.and(io::stderr)).init();
+            } else {
+                sub.with_writer(non_blocking).init();
+            }
+            Some(_guard)
+        } else {
+            sub.with_writer(io::stderr).init();
+            None
+        }
+    } else {
+        None
+    };
 
     debug!("args={args:?}");
 
-    // list the ports if the user asks for it
-    if args.list_ports {
-        let mut ports = serialport::available_ports()?;
-        ports.retain(|port| matches!(port.port_type, SerialPortType::UsbPort(_)));
-        println!("Found the following USB ports:");
-        for port in ports {
-            println!("{}", port.port_name);
-        }
+    let native_options = eframe::NativeOptions::default();
+    eframe::run_native(
+        "STM32 Flash Password Manager",
+        native_options,
+        Box::new(|cc| Box::new(Gui::new(cc))),
+    )
+    .unwrap();
 
-        return Ok(());
-    }
-
+    /*
     // open the serial port connection
     let port_name = args
         .port
@@ -142,6 +155,7 @@ fn main() -> Result<()> {
     };
 
     eprintln!("populated = {populated:02X?}");
+    */
 
     Ok(())
 }
