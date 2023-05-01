@@ -15,15 +15,13 @@ use tracing::{debug, error, info, trace, warn};
 
 /// function like macro to wrap sending data over the serial port, returns the number of bytes sent
 macro_rules! send {
-    ($serial_mtx:ident, $msg:ident) => {{
+    ($serial:expr, $msg:ident) => {{
         let serialised = postcard::to_stdvec_cobs(&$msg).expect("Failed to serialise message");
         trace!(
             "Sending {} byte long message - {serialised:02X?}",
             serialised.len()
         );
-        $serial_mtx
-            .lock()
-            .expect("Failed to acquire serial port mutex")
+        $serial
             .write_all(&serialised)
             .expect("Failed to write message to serial");
         thread::sleep(Duration::from_millis(10));
@@ -31,7 +29,7 @@ macro_rules! send {
 }
 
 pub fn register_user(
-    serial: &Mutex<Box<dyn SerialPort>>,
+    receiver: &mut MsgReceiver,
     base_client: &mut Client,
     user: &[u8],
     pass: &[u8],
@@ -40,7 +38,7 @@ pub fn register_user(
         .register_alloc_strong(user, pass, Params::recommended(), Scrypt)
         .map_err(|e| anyhow!(e))?;
 
-    send!(serial, message);
+    send!(receiver.serial_mut(), message);
     info!(
         "Registered {} with StrongAuCPace",
         String::from_utf8_lossy(user)
@@ -50,7 +48,6 @@ pub fn register_user(
 }
 
 pub fn establish_key(
-    serial: &Mutex<Box<dyn SerialPort>>,
     receiver: &mut MsgReceiver,
     base_client: &mut Client,
     user: &[u8],
@@ -59,7 +56,7 @@ pub fn establish_key(
     info!("Starting StrongAuCPace");
     // ===== SSID Establishment =====
     let (client, message) = base_client.begin();
-    send!(serial, message);
+    send!(receiver.serial_mut(), message);
 
     let mut server_message = receiver.recv_msg()?;
     let ServerMessage::Nonce(server_nonce) = server_message else {
@@ -70,7 +67,7 @@ pub fn establish_key(
 
     // ===== Augmentation Layer =====
     let (client, message) = client.start_augmentation_strong(user, pass, &mut OsRng);
-    send!(serial, message);
+    send!(receiver.serial_mut(), message);
     info!("Sent message: Strong Username");
 
     server_message = receiver.recv_msg()?;
@@ -92,7 +89,7 @@ pub fn establish_key(
     // ===== CPace substep =====
     let ci = "Server-USART2-Client-SerialPort";
     let (client, message) = client.generate_public_key(ci, &mut OsRng);
-    send!(serial, message);
+    send!(receiver.serial_mut(), message);
     info!("Sent PublicKey");
 
     server_message = receiver.recv_msg()?;
@@ -106,7 +103,7 @@ pub fn establish_key(
         .map_err(|e| anyhow!(e))?;
 
     // ===== Explicit Mutual Auth =====
-    send!(serial, message);
+    send!(receiver.serial_mut(), message);
     info!("Sent Authenticator");
 
     server_message = receiver.recv_msg()?;

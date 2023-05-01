@@ -89,14 +89,11 @@ impl<'uart> MsgReceiver<'uart> {
         postcard::from_bytes_cobs(&mut self.buf[..=zi])
     }
 
-    /// Retrieve the slice of data backing the previously parsed item
-    pub fn get_parsed_slice(&self) -> Option<&[u8]> {
-        self.reset_pos.map(|zi| &self.buf[..=zi])
-    }
-
     /// If the last message failed to parse you want to retry a different generic in recv_msg
     /// call this and it will set reset_pos = None, allowing recv_msg and then parse it again
     pub fn unparse_last_message(&mut self) {
+        // TODO: FIX THIS WITH COBS LMAO
+        // maybe do manual cobs encoding / decoding?
         self.reset_pos = None;
     }
 }

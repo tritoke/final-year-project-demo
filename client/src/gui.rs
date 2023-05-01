@@ -1,18 +1,25 @@
-use crate::USART_BAUD;
+use crate::auth::register_user;
+use crate::{auth::establish_key, msg_receiver::MsgReceiver, Client, K1, USART_BAUD};
+use aucpace::AuCPaceClient;
+use chacha20poly1305::Key;
 use eframe::egui;
-use egui::Key::S;
 use egui::{Align, Layout, Pos2, Rect, Ui, Vec2, Visuals};
 use egui_extras::{Column, Table, TableBuilder};
+use egui_notify::Toasts;
+use rand_core::OsRng;
 use serialport::{SerialPort, SerialPortType};
-use std::sync::{Arc, Mutex};
-use tracing::{info, warn};
+use std::time::Duration;
+use tracing::{debug, error, info, warn};
 
 pub struct Gui {
     state: State,
     user: String,
     pass: String,
     board_port: String,
-    board: Option<Arc<Mutex<Box<dyn SerialPort>>>>,
+    board: Option<MsgReceiver>,
+    aucpace_client: Client,
+    key: Option<Key>,
+    notifications: Toasts,
 }
 
 impl Default for Gui {
@@ -20,7 +27,10 @@ impl Default for Gui {
         let board = serialport::new("/dev/ttyACM0", USART_BAUD)
             .open()
             .ok()
-            .map(|serial| Arc::new(Mutex::new(serial)));
+            .map(|mut serial| {
+                serial.set_timeout(Duration::from_secs(5)).unwrap();
+                MsgReceiver::new(serial)
+            });
 
         Self {
             state: State::default(),
@@ -28,6 +38,9 @@ impl Default for Gui {
             pass: String::default(),
             board_port: String::from("/dev/ttyACM0"),
             board,
+            aucpace_client: AuCPaceClient::new(OsRng),
+            key: None,
+            notifications: Toasts::new(),
         }
     }
 }
@@ -36,15 +49,20 @@ impl Default for Gui {
 enum State {
     #[default]
     Login,
+    Homepage,
 }
 
 impl eframe::App for Gui {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.notifications.show(ctx);
         egui::TopBottomPanel::top("app_top_bar").show(ctx, |ui| {
             self.board_dropdown(ui);
         });
         egui::CentralPanel::default().show(ctx, |ui| match &mut self.state {
             State::Login => self.login_screen(ui),
+            State::Homepage => {
+                ui.heading("we at home 😌");
+            }
         });
     }
 }
@@ -85,7 +103,10 @@ impl Gui {
     fn change_board(&mut self) {
         let board = serialport::new(self.board_port.as_str(), USART_BAUD)
             .open()
-            .map(|serial| Arc::new(Mutex::new(serial)));
+            .map(|mut serial| {
+                serial.set_timeout(Duration::from_secs(5)).unwrap();
+                MsgReceiver::new(serial)
+            });
 
         match board {
             Ok(b) => self.board = Some(b),
@@ -123,12 +144,12 @@ impl Gui {
                         table_ui.row(20.0, |mut row| {
                             row.col(|ui| {
                                 if ui.button("Login").clicked() {
-                                    self.login();
+                                    self.login(ui.ctx());
                                 }
                             });
                             row.col(|ui| {
                                 if ui.button("Register").clicked() {
-                                    self.register();
+                                    self.register(ui.ctx());
                                 }
                             });
                         });
@@ -137,14 +158,50 @@ impl Gui {
         });
     }
 
-    fn login(&mut self) {
-        info!("Login");
-        todo!("login");
+    fn login(&mut self, ctx: &egui::Context) {
+        debug!("Attempting to login as {}", self.user);
+        let Some(receiver) = &mut self.board else {
+            self.notifications.warning("No serial connection, cannot login.");
+            return;
+        };
+
+        // setup the channel to receive the key
+        let res = establish_key(
+            receiver,
+            &mut self.aucpace_client,
+            self.user.as_bytes(),
+            self.pass.as_bytes(),
+        );
+        match res {
+            Ok(key) => {
+                self.notifications.info("Login successful.");
+                self.key = Some(key)
+            }
+            Err(e) => {
+                error!("Failed to establish shared key: {e:?}");
+                self.notifications
+                    .error(format!("Failed to establish shared key: {e:?}"));
+                return;
+            }
+        }
+        self.state = State::Homepage;
+        ctx.request_repaint();
     }
 
-    fn register(&mut self) {
-        info!("Register");
-        todo!("register");
-        self.login();
+    fn register(&mut self, ctx: &egui::Context) {
+        debug!("Attempting to login as {}", self.user);
+        let Some(receiver) = &mut self.board else {
+            self.notifications.warning("No serial connection, cannot Register.");
+            return;
+        };
+
+        register_user(
+            receiver,
+            &mut self.aucpace_client,
+            self.user.as_bytes(),
+            self.pass.as_bytes(),
+        )
+        .ok();
+        self.login(ctx);
     }
 }

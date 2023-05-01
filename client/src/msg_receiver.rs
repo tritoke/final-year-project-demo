@@ -5,21 +5,25 @@ use serialport::SerialPort;
 use std::sync::Mutex;
 use tracing::{trace, warn};
 
-pub struct MsgReceiver<'mtx> {
+pub struct MsgReceiver {
     buf: [u8; RECV_BUF_LEN],
     idx: usize,
-    mtx: &'mtx Mutex<Box<dyn SerialPort>>,
+    serial: Box<dyn SerialPort>,
     reset_pos: Option<usize>,
 }
 
-impl<'mtx> MsgReceiver<'mtx> {
-    pub fn new(mtx: &'mtx Mutex<Box<dyn SerialPort>>) -> Self {
+impl MsgReceiver {
+    pub fn new(serial: Box<dyn SerialPort>) -> Self {
         Self {
             buf: [0u8; 1024],
             idx: 0,
-            mtx,
+            serial,
             reset_pos: None,
         }
+    }
+
+    pub fn serial_mut(&mut self) -> &mut dyn SerialPort {
+        self.serial.as_mut()
     }
 
     pub fn recv_msg<'a, T: Deserialize<'a>>(&'a mut self) -> postcard::Result<T> {
@@ -31,15 +35,10 @@ impl<'mtx> MsgReceiver<'mtx> {
             self.reset_pos = None;
         }
 
-        // acquire a handle to the serial port
-        let mut serial = self
-            .mtx
-            .lock()
-            .expect("Failed to acquire lock for serial port.");
-
         loop {
             // read as much as we can off the wire
-            let count = serial
+            let count = self
+                .serial
                 .read(&mut self.buf[self.idx..])
                 .expect("Failed to read from serial port.");
             let zero_idx = if count == 0 {

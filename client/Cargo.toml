@@ -24,6 +24,7 @@ tracing-appender = "0.2.2"
 egui = "0.21.0"
 eframe = "0.21.3"
 egui_extras = "0.21.0"
+egui-notify = "0.6.0"
 
 [dependencies.aucpace]
 git = "https://github.com/RustCrypto/PAKEs"
