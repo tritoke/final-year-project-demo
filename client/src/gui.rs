@@ -1,4 +1,7 @@
 use crate::auth::register_user;
+use crate::metadata::Metadata;
+use crate::secret_key::SecretKey;
+use crate::utils::{compute_vault_key, decrypt_block};
 use crate::{auth::establish_key, msg_receiver::MsgReceiver, Client, K1, USART_BAUD};
 use aucpace::AuCPaceClient;
 use chacha20poly1305::Key;
@@ -8,6 +11,8 @@ use egui_extras::{Column, Table, TableBuilder};
 use egui_notify::Toasts;
 use rand_core::OsRng;
 use serialport::{SerialPort, SerialPortType};
+use shared::{Action, ActionToken, EncryptedMessage, Message, Response};
+use std::io::Write;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
@@ -19,6 +24,8 @@ pub struct Gui {
     board: Option<MsgReceiver>,
     aucpace_client: Client,
     key: Option<Key>,
+    vault_key: Option<Key>,
+    metadata: Metadata,
     notifications: Toasts,
 }
 
@@ -40,6 +47,8 @@ impl Default for Gui {
             board,
             aucpace_client: AuCPaceClient::new(OsRng),
             key: None,
+            vault_key: None,
+            metadata: Metadata::default(),
             notifications: Toasts::new(),
         }
     }
@@ -60,7 +69,41 @@ impl eframe::App for Gui {
         });
         egui::CentralPanel::default().show(ctx, |ui| match &mut self.state {
             State::Login => self.login_screen(ui),
+            // TODO: add a logout button
             State::Homepage => {
+                if !self.metadata.is_populated() {
+                    if self
+                        .send_action_request(Action::ReadSectorMetadata)
+                        .is_none()
+                    {
+                        self.notifications.warning("Failed to read sector metadata");
+                    }
+
+                    if let Some(Response::SectorMetadata { populated }) =
+                        self.read_action_response()
+                    {
+                        self.metadata = Metadata::new(populated);
+                    } else {
+                        self.notifications
+                            .warning("Got invalid response to request.");
+                    }
+                }
+
+                while let Some(entry_idx) = self.metadata.next_needed_entry_id() {
+                    if self
+                        .send_action_request(Action::ReadEntryMetadata { entry_idx })
+                        .is_none()
+                    {
+                        self.notifications.warning("Failed to read entry metadata");
+                    }
+
+                    if let Some(metadata) = self.read_entry_metadata() {
+                        self.metadata.add_entry(entry_idx, metadata)
+                    } else {
+                        self.notifications
+                            .warning("Got invalid response to request.");
+                    }
+                }
                 ui.heading("we at home 😌");
             }
         });
@@ -186,10 +229,30 @@ impl Gui {
         }
         self.state = State::Homepage;
         ctx.request_repaint();
+
+        let Ok(sk) = std::fs::read_to_string("demo.vault") else {
+            self.notifications.error("Failed to read demo.vault, unable to decrypt any entries")
+                .set_duration(None);
+            return;
+        };
+
+        let Ok(sk) = sk.parse() else {
+            self.notifications.error("Failed to parse secret key from demo.vault, unable to decrypt any entries")
+                .set_duration(None);
+            return;
+        };
+
+        let Ok(vk) = compute_vault_key(self.pass.as_bytes(), sk) else {
+            self.notifications.error("Failed to vault key from secret key, unable to decrypt any entries")
+                .set_duration(None);
+            return;
+        };
+
+        self.vault_key = Some(vk);
     }
 
     fn register(&mut self, ctx: &egui::Context) {
-        debug!("Attempting to login as {}", self.user);
+        debug!("Attempting to register as {}", self.user);
         let Some(receiver) = &mut self.board else {
             self.notifications.warning("No serial connection, cannot Register.");
             return;
@@ -202,6 +265,75 @@ impl Gui {
             self.pass.as_bytes(),
         )
         .ok();
+
+        // generate a secret key
+        let mut sk = SecretKey::generate(&mut OsRng);
+        if let Err(_) = std::fs::write("demo.vault", format!("{sk}")) {
+            self.notifications
+                .error(
+                    "Failed to write demo.vault, will be unable to add new entries to the vault.",
+                )
+                .set_duration(None);
+        }
         self.login(ctx);
+    }
+
+    fn read_action_token(&mut self) -> Option<ActionToken> {
+        let msg = self.read_message()?;
+        let Message::Token(action_token) = msg else {
+            return None;
+        };
+
+        Some(action_token)
+    }
+
+    fn send_action_request(&mut self, action: Action) -> Option<()> {
+        let token = self.read_action_token()?;
+        let msg = Message::ActionRequest { action, token };
+        let mut ser_msg = postcard::to_stdvec(&msg).ok()?;
+
+        let key = &self.key?;
+        let enc_msg = EncryptedMessage::encrypt(&mut ser_msg, key, &mut OsRng).ok()?;
+        let ser_enc_msg = postcard::to_stdvec_cobs(&enc_msg).ok()?;
+
+        let msg_receiver = self.board.as_mut()?;
+        msg_receiver.serial_mut().write_all(&ser_enc_msg).ok()
+    }
+
+    fn read_action_response(&mut self) -> Option<Response> {
+        let msg = self.read_message()?;
+        let Message::ActionResponse { response } = msg else {
+            return None;
+        };
+
+        Some(response)
+    }
+
+    fn read_message(&mut self) -> Option<Message> {
+        let msg_receiver = self.board.as_mut()?;
+        let key = &self.key?;
+
+        let enc_msg: EncryptedMessage = msg_receiver.recv_msg().ok()?;
+        let mut buf = [0u8; 512];
+
+        let msg = enc_msg.decrypt_into(key, &mut buf).ok()?;
+        postcard::from_bytes(msg).ok()
+    }
+
+    fn read_entry_metadata(&mut self) -> Option<String> {
+        let msg = self.read_message()?;
+        let Message::ActionResponse { response } = msg else {
+            return None;
+        };
+        let Response::EntryMetadata { metadata } = response else {
+            return None;
+        };
+
+        let dec = decrypt_block(metadata, &self.key?).ok()?;
+        if let Some(zi) = dec.iter().position(|x| *x == 0) {
+            Some(String::from_utf8_lossy(&dec[..zi]).ok())
+        } else {
+            Some(String::from_utf8_lossy(&dec).ok())
+        }
     }
 }

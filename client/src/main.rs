@@ -1,6 +1,13 @@
+#![feature(split_array)]
+
+extern crate core;
+
 mod auth;
 mod gui;
+mod metadata;
 mod msg_receiver;
+mod secret_key;
+mod utils;
 
 use anyhow::{anyhow, bail, Result};
 use aucpace::{AuCPaceClient, ServerMessage};

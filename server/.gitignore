@@ -2,3 +2,4 @@
 **/*.rs.bk
 /out
 *.hex
+demo.vault

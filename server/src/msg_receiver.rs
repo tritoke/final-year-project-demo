@@ -10,6 +10,8 @@ pub struct MsgReceiver<'uart> {
     idx: usize,
     rx: UartRx<'uart, peripherals::USART2, peripherals::DMA1_CH5>,
     reset_pos: Option<usize>,
+    cobs_decode_end: Option<usize>,
+    reparse_message: bool,
 }
 
 impl<'uart> MsgReceiver<'uart> {
@@ -19,16 +21,26 @@ impl<'uart> MsgReceiver<'uart> {
             idx: 0,
             rx,
             reset_pos: None,
+            cobs_decode_end: None,
+            reparse_message: false,
         }
     }
 
     pub async fn recv_msg<'a, T: Deserialize<'a>>(&'a mut self) -> postcard::Result<T> {
+        if self.reparse_message {
+            self.reparse_message = false;
+            if let Some(cde) = self.cobs_decode_end {
+                return postcard::from_bytes(&mut self.buf[..cde]);
+            }
+        }
+
         // reset the state
         // copy all the data we read after the 0 byte to the start of the self.buffer
         if let Some(zi) = self.reset_pos {
             self.buf.copy_within(zi + 1..self.idx, 0);
             self.idx = self.idx.saturating_sub(zi + 1);
             self.reset_pos = None;
+            self.cobs_decode_end = None;
         }
 
         // if there is a zero in the message buffer try to process that msg
@@ -85,15 +97,17 @@ impl<'uart> MsgReceiver<'uart> {
         // store zi for next time
         self.reset_pos = Some(zi);
 
+        // manually decode from COBS so we know where the valid data is
+        let cde = cobs::decode_in_place(&mut self.buf[..=zi])
+            .map_err(|_| postcard::Error::DeserializeBadEncoding)?;
+
+        self.cobs_decode_end = Some(cde);
+
         // parse the result
-        postcard::from_bytes_cobs(&mut self.buf[..=zi])
+        postcard::from_bytes(&mut self.buf[..cde])
     }
 
-    /// If the last message failed to parse you want to retry a different generic in recv_msg
-    /// call this and it will set reset_pos = None, allowing recv_msg and then parse it again
     pub fn unparse_last_message(&mut self) {
-        // TODO: FIX THIS WITH COBS LMAO
-        // maybe do manual cobs encoding / decoding?
-        self.reset_pos = None;
+        self.reparse_message = true;
     }
 }
