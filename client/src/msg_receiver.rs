@@ -3,6 +3,7 @@ use aucpace::ServerMessage;
 use serde::Deserialize;
 use serialport::SerialPort;
 use std::sync::Mutex;
+use thiserror::Error;
 use tracing::{trace, warn};
 
 pub struct MsgReceiver {
@@ -10,6 +11,14 @@ pub struct MsgReceiver {
     idx: usize,
     serial: Box<dyn SerialPort>,
     reset_pos: Option<usize>,
+}
+
+#[derive(Error, Debug)]
+pub enum RecvMessageError {
+    #[error("postcard failed to deserialise data")]
+    Postcard(#[from] postcard::Error),
+    #[error("IO failed")]
+    IoError(#[from] std::io::Error),
 }
 
 impl MsgReceiver {
@@ -26,7 +35,7 @@ impl MsgReceiver {
         self.serial.as_mut()
     }
 
-    pub fn recv_msg<'a, T: Deserialize<'a>>(&'a mut self) -> postcard::Result<T> {
+    pub fn recv_msg<'a, T: Deserialize<'a>>(&'a mut self) -> Result<T, RecvMessageError> {
         // reset the state
         // copy all the data we read after the 0 byte to the start of the self.buffer
         if let Some(zi) = self.reset_pos {
@@ -37,10 +46,7 @@ impl MsgReceiver {
 
         loop {
             // read as much as we can off the wire
-            let count = self
-                .serial
-                .read(&mut self.buf[self.idx..])
-                .expect("Failed to read from serial port.");
+            let count = self.serial.read(&mut self.buf[self.idx..])?;
             let zero_idx = if count == 0 {
                 continue;
             } else {
@@ -73,7 +79,7 @@ impl MsgReceiver {
 
             self.reset_pos = Some(zi);
             // parse the result
-            break postcard::from_bytes_cobs(&mut self.buf[..=zi]);
+            break Ok(postcard::from_bytes_cobs(&mut self.buf[..=zi])?);
         }
     }
 }

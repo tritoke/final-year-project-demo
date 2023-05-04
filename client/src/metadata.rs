@@ -50,4 +50,8 @@ impl Metadata {
             .iter()
             .find_map(|(entry_idx, data)| data.is_none().then_some(*entry_idx))
     }
+
+    pub fn is_populated(&self) -> bool {
+        self.populated
+    }
 }

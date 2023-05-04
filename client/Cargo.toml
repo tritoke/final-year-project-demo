@@ -28,6 +28,7 @@ eframe = "0.21.3"
 egui_extras = "0.21.0"
 egui-notify = "0.6.0"
 serde-byte-array = "0.1.2"
+thiserror = "1.0.40"
 
 [dependencies.aucpace]
 git = "https://github.com/RustCrypto/PAKEs"

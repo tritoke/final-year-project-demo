@@ -14,7 +14,10 @@ use serialport::{SerialPort, SerialPortType};
 use shared::{Action, ActionToken, EncryptedMessage, Message, Response};
 use std::io::Write;
 use std::time::Duration;
+use thiserror::Error;
 use tracing::{debug, error, info, warn};
+
+const SERIAL_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct Gui {
     state: State,
@@ -27,6 +30,10 @@ pub struct Gui {
     vault_key: Option<Key>,
     metadata: Metadata,
     notifications: Toasts,
+    show_new_entry_window: bool,
+    new_entry_title: String,
+    new_entry_username: String,
+    new_entry_password: String,
 }
 
 impl Default for Gui {
@@ -35,7 +42,7 @@ impl Default for Gui {
             .open()
             .ok()
             .map(|mut serial| {
-                serial.set_timeout(Duration::from_secs(5)).unwrap();
+                serial.set_timeout(SERIAL_TIMEOUT).unwrap();
                 MsgReceiver::new(serial)
             });
 
@@ -50,11 +57,15 @@ impl Default for Gui {
             vault_key: None,
             metadata: Metadata::default(),
             notifications: Toasts::new(),
+            show_new_entry_window: false,
+            new_entry_title: String::new(),
+            new_entry_username: String::new(),
+            new_entry_password: String::new(),
         }
     }
 }
 
-#[derive(Default)]
+#[derive(Default, PartialEq, Eq, Copy, Clone)]
 enum State {
     #[default]
     Login,
@@ -65,46 +76,34 @@ impl eframe::App for Gui {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.notifications.show(ctx);
         egui::TopBottomPanel::top("app_top_bar").show(ctx, |ui| {
-            self.board_dropdown(ui);
+            ui.horizontal(|ui| {
+                self.board_dropdown(ui);
+
+                ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
+                    if self.state == State::Homepage {
+                        if ui.button("Add Entry").clicked() {
+                            self.show_new_entry_window = true;
+                        }
+                    }
+                });
+            });
         });
+
+        if self.show_new_entry_window {
+            let mut open = true;
+            egui::Window::new("New Entry")
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    self.new_entry_window(ui);
+                });
+            self.show_new_entry_window = open;
+        }
         egui::CentralPanel::default().show(ctx, |ui| match &mut self.state {
             State::Login => self.login_screen(ui),
             // TODO: add a logout button
             State::Homepage => {
-                if !self.metadata.is_populated() {
-                    if self
-                        .send_action_request(Action::ReadSectorMetadata)
-                        .is_none()
-                    {
-                        self.notifications.warning("Failed to read sector metadata");
-                    }
-
-                    if let Some(Response::SectorMetadata { populated }) =
-                        self.read_action_response()
-                    {
-                        self.metadata = Metadata::new(populated);
-                    } else {
-                        self.notifications
-                            .warning("Got invalid response to request.");
-                    }
-                }
-
-                while let Some(entry_idx) = self.metadata.next_needed_entry_id() {
-                    if self
-                        .send_action_request(Action::ReadEntryMetadata { entry_idx })
-                        .is_none()
-                    {
-                        self.notifications.warning("Failed to read entry metadata");
-                    }
-
-                    if let Some(metadata) = self.read_entry_metadata() {
-                        self.metadata.add_entry(entry_idx, metadata)
-                    } else {
-                        self.notifications
-                            .warning("Got invalid response to request.");
-                    }
-                }
-                ui.heading("we at home 😌");
+                // load metadata -- this is basically a nop once loaded
+                self.load_metadata();
             }
         });
     }
@@ -143,11 +142,140 @@ impl Gui {
             });
     }
 
+    fn load_metadata(&mut self) {
+        if !self.metadata.is_populated() {
+            if self
+                .send_action_request(Action::ReadSectorMetadata)
+                .is_none()
+            {
+                self.notifications.warning("Failed to read sector metadata");
+            }
+
+            if let Some(Response::SectorMetadata { populated }) = self.read_action_response() {
+                self.metadata = Metadata::new(populated);
+            } else {
+                self.notifications
+                    .warning("Got invalid response to request.");
+            }
+        }
+
+        while let Some(entry_idx) = self.metadata.next_needed_entry_id() {
+            if self
+                .send_action_request(Action::ReadEntryMetadata { entry_idx })
+                .is_none()
+            {
+                self.notifications.warning("Failed to read entry metadata");
+            }
+
+            if let Some(metadata) = self.read_entry_metadata() {
+                self.metadata.add_entry(entry_idx, metadata)
+            } else {
+                self.notifications
+                    .warning("Got invalid response to request.");
+            }
+        }
+    }
+
+    fn left_right_row(
+        ui: &mut Ui,
+        add_left_contents: impl FnOnce(&mut Ui),
+        add_right_contents: impl FnOnce(&mut Ui),
+    ) {
+        ui.horizontal(|ui| {
+            add_left_contents(ui);
+            ui.with_layout(Layout::right_to_left(Align::Center), add_right_contents);
+        });
+    }
+
+    fn new_entry_window(&mut self, ui: &mut Ui) {
+        const TEXT_EDIT_WIDTH: f32 = 200.0;
+        Self::left_right_row(
+            ui,
+            |ui| {
+                ui.heading("Entry Name:");
+            },
+            |ui| {
+                egui::TextEdit::singleline(&mut self.new_entry_title)
+                    .desired_width(TEXT_EDIT_WIDTH)
+                    .show(ui);
+            },
+        );
+        ui.separator();
+        Self::left_right_row(
+            ui,
+            |ui| {
+                ui.heading("Username:");
+            },
+            |ui| {
+                egui::TextEdit::singleline(&mut self.new_entry_username)
+                    .desired_width(TEXT_EDIT_WIDTH)
+                    .show(ui);
+            },
+        );
+        Self::left_right_row(
+            ui,
+            |ui| {
+                ui.heading("Password:");
+            },
+            |ui| {
+                egui::TextEdit::singleline(&mut self.new_entry_password)
+                    .desired_width(TEXT_EDIT_WIDTH)
+                    .show(ui);
+            },
+        );
+        ui.add_space(10.0);
+        ui.vertical_centered(|ui| {
+            if ui.button("Add entry").clicked() {
+                // first validate the size requirements
+                let title_len = self.new_entry_title.len();
+                if title_len > 100 {
+                    self.notifications.warning(format!(
+                        "Entry title is {} characters too long",
+                        title_len - 100
+                    ));
+                    return;
+                } else if title_len == 0 {
+                    self.notifications.warning("Entry title cannot be empty.");
+                    return;
+                }
+
+                let username_len = self.new_entry_username.len();
+                if username_len > 60 {
+                    self.notifications.warning(format!(
+                        "Entry username is {} characters too long",
+                        username_len - 60
+                    ));
+                    return;
+                } else if username_len == 0 {
+                    self.notifications
+                        .warning("Entry username cannot be empty.");
+                    return;
+                }
+
+                let password_len = self.new_entry_password.len();
+                if password_len > 40 {
+                    self.notifications.warning(format!(
+                        "Entry password is {} characters too long",
+                        password_len - 40
+                    ));
+                    return;
+                } else if password_len == 0 {
+                    self.notifications
+                        .warning("Entry password cannot be empty.");
+                    return;
+                }
+
+                // TODO: actually implement this
+                self.notifications.info("Creating a new entry.");
+            }
+        });
+    }
+
     fn change_board(&mut self) {
         let board = serialport::new(self.board_port.as_str(), USART_BAUD)
             .open()
             .map(|mut serial| {
-                serial.set_timeout(Duration::from_secs(5)).unwrap();
+                serial.set_timeout(SERIAL_TIMEOUT).unwrap();
                 MsgReceiver::new(serial)
             });
 
@@ -223,7 +351,7 @@ impl Gui {
             Err(e) => {
                 error!("Failed to establish shared key: {e:?}");
                 self.notifications
-                    .error(format!("Failed to establish shared key: {e:?}"));
+                    .error(format!("Failed to establish shared key."));
                 return;
             }
         }
@@ -331,9 +459,9 @@ impl Gui {
 
         let dec = decrypt_block(metadata, &self.key?).ok()?;
         if let Some(zi) = dec.iter().position(|x| *x == 0) {
-            Some(String::from_utf8_lossy(&dec[..zi]).ok())
+            Some(String::from_utf8_lossy(&dec[..zi]).to_string())
         } else {
-            Some(String::from_utf8_lossy(&dec).ok())
+            Some(String::from_utf8_lossy(&dec).to_string())
         }
     }
 }
