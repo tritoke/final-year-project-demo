@@ -1,10 +1,11 @@
 use crate::auth::register_user;
 use crate::metadata::Metadata;
 use crate::secret_key::SecretKey;
-use crate::utils::{compute_vault_key, decrypt_block};
+use crate::utils::{compute_vault_key, decrypt_block, encrypt_block};
 use crate::{auth::establish_key, msg_receiver::MsgReceiver, Client, K1, USART_BAUD};
 use aucpace::AuCPaceClient;
-use chacha20poly1305::Key;
+use chacha20poly1305::aead::Aead;
+use chacha20poly1305::{AeadCore, ChaCha20Poly1305, Key, KeyInit};
 use eframe::egui;
 use egui::{Align, Layout, Pos2, Rect, Ui, Vec2, Visuals};
 use egui_extras::{Column, Table, TableBuilder};
@@ -13,11 +14,12 @@ use rand_core::OsRng;
 use serialport::{SerialPort, SerialPortType};
 use shared::{Action, ActionToken, EncryptedMessage, Message, Response};
 use std::io::Write;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thiserror::Error;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 const SERIAL_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_BACKOFF_TIME: Duration = Duration::from_millis(10);
 
 pub struct Gui {
     state: State,
@@ -34,6 +36,8 @@ pub struct Gui {
     new_entry_title: String,
     new_entry_username: String,
     new_entry_password: String,
+    exp_backoff_metadata_fetch_fail_time: Duration,
+    metadata_last_fetch_attempt_time: Instant,
 }
 
 impl Default for Gui {
@@ -61,6 +65,8 @@ impl Default for Gui {
             new_entry_title: String::new(),
             new_entry_username: String::new(),
             new_entry_password: String::new(),
+            exp_backoff_metadata_fetch_fail_time: DEFAULT_BACKOFF_TIME,
+            metadata_last_fetch_attempt_time: Instant::now(),
         }
     }
 }
@@ -85,6 +91,17 @@ impl eframe::App for Gui {
                             self.show_new_entry_window = true;
                         }
                     }
+                    if self.state != State::Login {
+                        if ui.button("Logout").clicked() {
+                            self.show_new_entry_window = false;
+                            self.state = State::Login;
+                            self.user.clear();
+                            self.user.clear();
+                            self.new_entry_title.clear();
+                            self.new_entry_username.clear();
+                            self.new_entry_password.clear();
+                        }
+                    }
                 });
             });
         });
@@ -100,7 +117,6 @@ impl eframe::App for Gui {
         }
         egui::CentralPanel::default().show(ctx, |ui| match &mut self.state {
             State::Login => self.login_screen(ui),
-            // TODO: add a logout button
             State::Homepage => {
                 // load metadata -- this is basically a nop once loaded
                 self.load_metadata();
@@ -143,6 +159,12 @@ impl Gui {
     }
 
     fn load_metadata(&mut self) {
+        if Instant::now().duration_since(self.metadata_last_fetch_attempt_time)
+            < self.exp_backoff_metadata_fetch_fail_time
+        {
+            return;
+        }
+
         if !self.metadata.is_populated() {
             if self
                 .send_action_request(Action::ReadSectorMetadata)
@@ -159,7 +181,8 @@ impl Gui {
             }
         }
 
-        while let Some(entry_idx) = self.metadata.next_needed_entry_id() {
+        if let Some(entry_idx) = self.metadata.next_needed_entry_id() {
+            debug!("entry_idx = {entry_idx}");
             if self
                 .send_action_request(Action::ReadEntryMetadata { entry_idx })
                 .is_none()
@@ -168,8 +191,16 @@ impl Gui {
             }
 
             if let Some(metadata) = self.read_entry_metadata() {
-                self.metadata.add_entry(entry_idx, metadata)
+                debug!("entry_idx = {entry_idx}, metadata = {metadata:?}");
+                self.notifications
+                    .info(format!("Loaded entry {entry_idx} - {metadata:?}"));
+                self.metadata.add_entry(entry_idx, metadata);
+                self.exp_backoff_metadata_fetch_fail_time = DEFAULT_BACKOFF_TIME;
             } else {
+                debug!("Failed to read entry metadata");
+                self.metadata_last_fetch_attempt_time = Instant::now();
+                self.exp_backoff_metadata_fetch_fail_time *= 2;
+
                 self.notifications
                     .warning("Got invalid response to request.");
             }
@@ -226,47 +257,103 @@ impl Gui {
         ui.add_space(10.0);
         ui.vertical_centered(|ui| {
             if ui.button("Add entry").clicked() {
+                let title = self.new_entry_title.as_bytes();
+                let user = self.new_entry_username.as_bytes();
+                let pass = self.new_entry_password.as_bytes();
+
                 // first validate the size requirements
-                let title_len = self.new_entry_title.len();
-                if title_len > 100 {
+                if title.len() > 100 {
                     self.notifications.warning(format!(
                         "Entry title is {} characters too long",
-                        title_len - 100
+                        title.len() - 100
                     ));
                     return;
-                } else if title_len == 0 {
+                } else if title.len() == 0 {
                     self.notifications.warning("Entry title cannot be empty.");
                     return;
                 }
 
-                let username_len = self.new_entry_username.len();
-                if username_len > 60 {
+                if user.len() > 60 {
                     self.notifications.warning(format!(
                         "Entry username is {} characters too long",
-                        username_len - 60
+                        user.len() - 60
                     ));
                     return;
-                } else if username_len == 0 {
+                } else if title.len() == 0 {
                     self.notifications
                         .warning("Entry username cannot be empty.");
                     return;
                 }
 
-                let password_len = self.new_entry_password.len();
-                if password_len > 40 {
+                if pass.len() > 40 {
                     self.notifications.warning(format!(
                         "Entry password is {} characters too long",
-                        password_len - 40
+                        pass.len() - 40
                     ));
                     return;
-                } else if password_len == 0 {
+                } else if pass.len() == 0 {
                     self.notifications
                         .warning("Entry password cannot be empty.");
                     return;
                 }
 
-                // TODO: actually implement this
+                let Some(key) = self.vault_key.as_ref() else {
+                    self.notifications.error("No vault key - cannot create entry.");
+                    return;
+                };
+
                 self.notifications.info("Creating a new entry.");
+
+                // create the encrypted entry
+                // 100 chars for metadata
+                let mut meta_buf = [0u8; 100];
+                meta_buf[..title.len()].copy_from_slice(title);
+                let Ok(meta_ct ) = encrypt_block(meta_buf, key) else {
+                    self.notifications.error("Failed to encrypt data.");
+                    return;
+                };
+
+                // first 60 chars are for username
+                // last 40 chars are for username
+                let mut data_buf = [0u8; 100];
+                let (user_buf, pass_buf) = data_buf.split_at_mut(60);
+                user_buf[..user.len()].copy_from_slice(user);
+                pass_buf[..pass.len()].copy_from_slice(pass);
+                let Ok(data_ct) = encrypt_block(data_buf, key) else {
+                    self.notifications.error("Failed to encrypt data.");
+                    return;
+                };
+
+                // now we can construct the message
+                let action = Action::Create {
+                    enc_data: data_ct
+                        .as_slice()
+                        .try_into()
+                        .expect("length invariant broken."),
+                    metadata: meta_ct
+                        .as_slice()
+                        .try_into()
+                        .expect("length invariant broken."),
+                };
+
+                self.send_action_request(action);
+
+                let Some(resp) = self.read_action_response() else {
+                    self.notifications.warning("Failed to read response, entry creation may have failed");
+                    return;
+                };
+
+                let Response::NewEntry { index } = resp else {
+                    self.notifications.error("Got invalid response, please try again.");
+                    return;
+                };
+
+                // add the new entry to the metadata
+                self.metadata.add_entry(index, std::mem::take(&mut self.new_entry_title));
+                self.new_entry_password.clear();
+                self.new_entry_username.clear();
+                self.show_new_entry_window = false;
+                self.notifications.info("Successfully created new entry.");
             }
         });
     }
@@ -457,7 +544,7 @@ impl Gui {
             return None;
         };
 
-        let dec = decrypt_block(metadata, &self.key?).ok()?;
+        let dec = decrypt_block(metadata, &self.vault_key?).ok()?;
         if let Some(zi) = dec.iter().position(|x| *x == 0) {
             Some(String::from_utf8_lossy(&dec[..zi]).to_string())
         } else {
