@@ -45,6 +45,10 @@ impl Metadata {
         self.entries.insert(entry_idx, Some(metadata));
     }
 
+    pub fn del_entry(&mut self, entry_idx: u32) {
+        self.entries.remove(&entry_idx);
+    }
+
     pub fn next_needed_entry_id(&self) -> Option<u32> {
         self.entries
             .iter()

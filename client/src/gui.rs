@@ -3,11 +3,12 @@ use crate::metadata::Metadata;
 use crate::secret_key::SecretKey;
 use crate::utils::{compute_vault_key, decrypt_block, encrypt_block};
 use crate::{auth::establish_key, msg_receiver::MsgReceiver, Client, K1, USART_BAUD};
+use anyhow::Context;
 use aucpace::AuCPaceClient;
 use chacha20poly1305::aead::Aead;
 use chacha20poly1305::{AeadCore, ChaCha20Poly1305, Key, KeyInit};
 use eframe::egui;
-use egui::{Align, Layout, Pos2, Rect, Ui, Vec2, Visuals};
+use egui::{Align, Layout, Pos2, Rect, RichText, Ui, Vec2, Visuals};
 use egui_extras::{Column, Table, TableBuilder};
 use egui_notify::Toasts;
 use rand_core::OsRng;
@@ -38,6 +39,16 @@ pub struct Gui {
     new_entry_password: String,
     exp_backoff_metadata_fetch_fail_time: Duration,
     metadata_last_fetch_attempt_time: Instant,
+    currently_shown_entry_idx: Option<u32>,
+    current_entry_user: String,
+    current_entry_pass: String,
+    current_entry_title: String,
+    current_entry_show_pass: bool,
+    show_change_entry_window: bool,
+    change_entry_user: String,
+    change_entry_pass: String,
+    change_entry_title: String,
+    change_entry_idx: Option<u32>,
 }
 
 impl Default for Gui {
@@ -67,6 +78,16 @@ impl Default for Gui {
             new_entry_password: String::new(),
             exp_backoff_metadata_fetch_fail_time: DEFAULT_BACKOFF_TIME,
             metadata_last_fetch_attempt_time: Instant::now(),
+            currently_shown_entry_idx: None,
+            current_entry_user: String::new(),
+            current_entry_pass: String::new(),
+            current_entry_title: String::new(),
+            current_entry_show_pass: false,
+            show_change_entry_window: false,
+            change_entry_user: String::new(),
+            change_entry_pass: String::new(),
+            change_entry_title: String::new(),
+            change_entry_idx: None,
         }
     }
 }
@@ -96,10 +117,28 @@ impl eframe::App for Gui {
                             self.show_new_entry_window = false;
                             self.state = State::Login;
                             self.user.clear();
-                            self.user.clear();
+                            self.pass.clear();
                             self.new_entry_title.clear();
                             self.new_entry_username.clear();
                             self.new_entry_password.clear();
+                        }
+
+                        if ui
+                            .button("Delete EVERYTHING")
+                            .on_hover_text(
+                                "Double click to delete everything - this is unrecoverable.",
+                            )
+                            .double_clicked()
+                        {
+                            let Some(()) = self.send_action_request(Action::TheNsaAreHere) else {
+                                self.notifications.error("Failed to delete everything");
+                                return;
+                            };
+                            let Some(Response::Success) = self.read_action_response() else {
+                                self.notifications.error("Failed to delete everything");
+                                return;
+                            };
+                            *self = Self::default();
                         }
                     }
                 });
@@ -115,13 +154,30 @@ impl eframe::App for Gui {
                 });
             self.show_new_entry_window = open;
         }
-        egui::CentralPanel::default().show(ctx, |ui| match &mut self.state {
-            State::Login => self.login_screen(ui),
+
+        if self.show_change_entry_window {
+            let mut open = true;
+            egui::Window::new("Change Entry")
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    self.change_entry_window(ui);
+                });
+            self.show_change_entry_window = open;
+        }
+
+        match self.state {
+            State::Login => {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    self.login_screen(ui);
+                });
+            }
             State::Homepage => {
                 // load metadata -- this is basically a nop once loaded
                 self.load_metadata();
+                self.entry_sidebar(ctx);
+                self.main_entry(ctx);
             }
-        });
+        }
     }
 }
 
@@ -191,9 +247,7 @@ impl Gui {
             }
 
             if let Some(metadata) = self.read_entry_metadata() {
-                debug!("entry_idx = {entry_idx}, metadata = {metadata:?}");
-                self.notifications
-                    .info(format!("Loaded entry {entry_idx} - {metadata:?}"));
+                debug!("Loaded entry_idx = {entry_idx}, metadata = {metadata:?}");
                 self.metadata.add_entry(entry_idx, metadata);
                 self.exp_backoff_metadata_fetch_fail_time = DEFAULT_BACKOFF_TIME;
             } else {
@@ -355,6 +409,286 @@ impl Gui {
                 self.show_new_entry_window = false;
                 self.notifications.info("Successfully created new entry.");
             }
+        });
+    }
+
+    fn entry_sidebar(&mut self, ctx: &egui::Context) {
+        egui::SidePanel::left("Entry sidebar")
+            .exact_width(300.0)
+            .show(ctx, |ui| {
+                ui.vertical_centered_justified(|ui| {
+                    let mut set_entry = None;
+                    for (entry_idx, entry_name) in self.metadata.entries() {
+                        let label_text = entry_name
+                            .clone()
+                            .unwrap_or_else(|| String::from("-- NOT YET LOADED --"));
+                        let label = ui.selectable_label(
+                            self.currently_shown_entry_idx == Some(*entry_idx),
+                            label_text,
+                        );
+                        if label.clicked() {
+                            set_entry = Some(*entry_idx);
+                        }
+                    }
+                    if let Some(entry_idx) = set_entry {
+                        self.set_current_entry(Some(entry_idx));
+                    }
+                });
+            });
+    }
+
+    fn change_entry_window(&mut self, ui: &mut Ui) {
+        const TEXT_EDIT_WIDTH: f32 = 200.0;
+        Self::left_right_row(
+            ui,
+            |ui| {
+                ui.heading("Entry Name:");
+            },
+            |ui| {
+                egui::TextEdit::singleline(&mut self.change_entry_title)
+                    .desired_width(TEXT_EDIT_WIDTH)
+                    .show(ui);
+            },
+        );
+        ui.separator();
+        Self::left_right_row(
+            ui,
+            |ui| {
+                ui.heading("Username:");
+            },
+            |ui| {
+                egui::TextEdit::singleline(&mut self.change_entry_user)
+                    .desired_width(TEXT_EDIT_WIDTH)
+                    .show(ui);
+            },
+        );
+        Self::left_right_row(
+            ui,
+            |ui| {
+                ui.heading("Password:");
+            },
+            |ui| {
+                egui::TextEdit::singleline(&mut self.change_entry_pass)
+                    .desired_width(TEXT_EDIT_WIDTH)
+                    .show(ui);
+            },
+        );
+        ui.add_space(10.0);
+        ui.vertical_centered(|ui| {
+            if ui.button("Update Entry").clicked() {
+                let title = self.change_entry_title.as_bytes();
+                let user = self.change_entry_user.as_bytes();
+                let pass = self.change_entry_pass.as_bytes();
+
+                // first validate the size requirements
+                if title.len() > 100 {
+                    self.notifications.warning(format!(
+                        "Entry title is {} characters too long",
+                        title.len() - 100
+                    ));
+                    return;
+                } else if title.len() == 0 {
+                    self.notifications.warning("Entry title cannot be empty.");
+                    return;
+                }
+
+                if user.len() > 60 {
+                    self.notifications.warning(format!(
+                        "Entry username is {} characters too long",
+                        user.len() - 60
+                    ));
+                    return;
+                } else if title.len() == 0 {
+                    self.notifications
+                        .warning("Entry username cannot be empty.");
+                    return;
+                }
+
+                if pass.len() > 40 {
+                    self.notifications.warning(format!(
+                        "Entry password is {} characters too long",
+                        pass.len() - 40
+                    ));
+                    return;
+                } else if pass.len() == 0 {
+                    self.notifications
+                        .warning("Entry password cannot be empty.");
+                    return;
+                }
+
+                let Some(key) = self.vault_key.as_ref() else {
+                    self.notifications.error("No vault key - cannot change entry.");
+                    return;
+                };
+
+                self.notifications.info("Changing entry.");
+
+                // create the encrypted entry
+                // 100 chars for metadata
+                let mut meta_buf = [0u8; 100];
+                meta_buf[..title.len()].copy_from_slice(title);
+                let Ok(meta_ct ) = encrypt_block(meta_buf, key) else {
+                    self.notifications.error("Failed to encrypt data.");
+                    return;
+                };
+
+                // first 60 chars are for username
+                // last 40 chars are for username
+                let mut data_buf = [0u8; 100];
+                let (user_buf, pass_buf) = data_buf.split_at_mut(60);
+                user_buf[..user.len()].copy_from_slice(user);
+                pass_buf[..pass.len()].copy_from_slice(pass);
+                let Ok(data_ct) = encrypt_block(data_buf, key) else {
+                    self.notifications.error("Failed to encrypt data.");
+                    return;
+                };
+
+                // now we can construct the message
+                let action = Action::Update {
+                    entry_idx: self.change_entry_idx.unwrap(),
+                    new_enc_data: data_ct
+                        .as_slice()
+                        .try_into()
+                        .expect("length invariant broken."),
+                    new_metadata: meta_ct
+                        .as_slice()
+                        .try_into()
+                        .expect("length invariant broken."),
+                };
+
+                self.send_action_request(action);
+
+                let Some(resp) = self.read_action_response() else {
+                    self.notifications.warning("Failed to read response, entry change may have failed");
+                    return;
+                };
+
+                let Response::NewEntry { index } = resp else {
+                    self.notifications.error("Got invalid response, please try again.");
+                    return;
+                };
+
+                // add the new entry to the metadata
+                if self.currently_shown_entry_idx == self.change_entry_idx {
+                    self.set_current_entry(Some(index));
+                }
+                self.metadata.del_entry(self.change_entry_idx.unwrap());
+                self.metadata.add_entry(index, std::mem::take(&mut self.change_entry_title));
+                self.change_entry_idx = None;
+                self.change_entry_pass.clear();
+                self.change_entry_user.clear();
+                self.show_change_entry_window = false;
+                self.notifications.info("Successfully changed entry.");
+            }
+        });
+    }
+
+    fn set_current_entry(&mut self, entry_idx: Option<u32>) {
+        self.currently_shown_entry_idx = entry_idx;
+        self.current_entry_pass.clear();
+        self.current_entry_user.clear();
+        self.current_entry_title.clear();
+        self.current_entry_show_pass = false;
+    }
+
+    fn main_entry(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            // show nothing if we don't have an entry
+            let Some(entry_idx) = self.currently_shown_entry_idx else {
+                return;
+            };
+            if self.current_entry_user.is_empty() {
+                if let None = self.send_action_request(Action::Read { entry_idx }) {
+                    self.notifications.error("Failed to get the entry");
+                    return;
+                };
+                let Some(Response::Entry { data, metadata }) = self.read_action_response() else {
+                    self.notifications.error("Failed to read response.");
+                    return;
+                };
+                let Some(key) = self.vault_key.as_ref() else {
+                    self.notifications.error("No vault key present, cannot decrypt entry.");
+                    return;
+                };
+                let Ok(dec_data) = decrypt_block(data, key) else {
+                    self.notifications.error("Failed to decrypt data.");
+                    return;
+                };
+                let Ok(dec_metadata) = decrypt_block(metadata, key) else {
+                    self.notifications.error("Failed to decrypt metadata.");
+                    return;
+                };
+                let (user_ref, pass_ref) = dec_data.split_at(60);
+                let user_len = user_ref
+                    .iter()
+                    .position(|x| *x == 0)
+                    .unwrap_or(user_ref.len());
+                self.current_entry_user =
+                    String::from_utf8_lossy(&user_ref[..user_len]).to_string();
+
+                let pass_len = pass_ref
+                    .iter()
+                    .position(|x| *x == 0)
+                    .unwrap_or(pass_ref.len());
+                self.current_entry_pass =
+                    String::from_utf8_lossy(&pass_ref[..pass_len]).to_string();
+
+                let title_len = dec_metadata
+                    .iter()
+                    .position(|x| *x == 0)
+                    .unwrap_or(dec_metadata.len());
+                self.current_entry_title =
+                    String::from_utf8_lossy(&dec_metadata[..title_len]).to_string();
+            }
+
+            egui::Grid::new("main_entry_grid")
+                .num_columns(2)
+                .spacing([0., 10.])
+                .show(ui, |ui| {
+                    ui.label("Title: ");
+                    ui.label(self.current_entry_title.as_str());
+                    ui.end_row();
+
+                    ui.separator();
+                    ui.separator();
+                    ui.end_row();
+
+                    ui.label("Username: ");
+                    copy_text(ui, &self.current_entry_user, None);
+                    ui.end_row();
+
+                    ui.label("Password: ");
+                    copy_text(
+                        ui,
+                        &self.current_entry_pass,
+                        Some(&mut self.current_entry_show_pass),
+                    );
+                    ui.end_row();
+
+                    if ui.button("Change").clicked() {
+                        self.notifications.info("Change");
+                        self.show_change_entry_window = true;
+                        self.change_entry_title = self.current_entry_title.clone();
+                        self.change_entry_user = self.current_entry_user.clone();
+                        self.change_entry_pass = self.current_entry_pass.clone();
+                        self.change_entry_idx = Some(entry_idx);
+                    }
+                    if ui.button("Delete").clicked() {
+                        self.notifications.info("Delete");
+                        if let None = self.send_action_request(Action::Delete { entry_idx }) {
+                            self.notifications.error("Failed to delete the entry.");
+                            return;
+                        }
+                        let Some(Response::Success) = self.read_action_response() else {
+                            self.notifications.error("Failed to delete the entry.");
+                            return;
+                        };
+                        self.notifications.info("Deleted entry.");
+                        self.set_current_entry(None);
+                        self.metadata.del_entry(entry_idx);
+                    }
+                    ui.end_row();
+                });
         });
     }
 
@@ -551,4 +885,31 @@ impl Gui {
             Some(String::from_utf8_lossy(&dec).to_string())
         }
     }
+}
+
+// nicked from:
+// https://github.dev/numfin/pwd-manager/blob/main/gui/src/egui_app.rs#L14
+fn copy_text(ui: &mut Ui, value: &str, secret: Option<&mut bool>) -> egui::InnerResponse<()> {
+    egui::Frame::default().show(ui, |ui| {
+        match secret {
+            Some(false) => {
+                ui.label(RichText::new("*".repeat(value.len())).monospace());
+            }
+            _ => {
+                ui.label(RichText::new(value).monospace());
+            }
+        };
+        if ui.button("copy").clicked() {
+            ui.output_mut(|o| o.copied_text = value.to_owned());
+        }
+        if let Some(hide_secret) = secret {
+            let toggle_label = match hide_secret {
+                true => "hide",
+                false => "show",
+            };
+            if ui.button(toggle_label).clicked() {
+                *hide_secret = !*hide_secret;
+            }
+        }
+    })
 }

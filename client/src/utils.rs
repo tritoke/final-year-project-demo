@@ -13,11 +13,13 @@ pub fn compute_vault_key(password: &[u8], secret_key: SecretKey) -> password_has
     Ok(Key::from_slice(hash_bytes.as_bytes()).clone())
 }
 
-pub fn decrypt_block(block: [u8; 128], key: &Key) -> chacha20poly1305::aead::Result<Vec<u8>> {
+pub fn decrypt_block(block: [u8; 128], key: &Key) -> chacha20poly1305::aead::Result<[u8; 100]> {
     let cipher = ChaCha20Poly1305::new(key);
     let (data, nonce) = block.split_at(128 - 12);
     let nonce = Nonce::from_slice(nonce);
-    cipher.decrypt(&nonce, data)
+    cipher
+        .decrypt(&nonce, data)
+        .map(|v| v.as_slice().try_into().expect("length invariant broken"))
 }
 
 pub fn encrypt_block(data: [u8; 100], key: &Key) -> chacha20poly1305::aead::Result<[u8; 128]> {
@@ -25,7 +27,5 @@ pub fn encrypt_block(data: [u8; 100], key: &Key) -> chacha20poly1305::aead::Resu
     let nonce = ChaCha20Poly1305::generate_nonce(OsRng);
     let mut out = cipher.encrypt(&nonce, data.as_slice())?;
     out.extend_from_slice(nonce.as_slice());
-    Ok(out
-        .try_into()
-        .expect("Encryption wrote an unexpected number of bytes."))
+    Ok(out.try_into().expect("length invariant broken"))
 }
