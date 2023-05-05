@@ -37,6 +37,7 @@ impl Metadata {
         self.entries.iter()
     }
 
+    #[allow(unused)]
     pub fn get_entry(&self, entry_idx: u32) -> Option<&String> {
         self.entries.get(&entry_idx)?.as_ref()
     }

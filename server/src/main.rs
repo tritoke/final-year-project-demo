@@ -140,7 +140,7 @@ async fn main(_spawner: Spawner) -> ! {
                 };
 
                 // respond to the request
-                let mut are_the_nsa_here = false;
+                let are_the_nsa_here;
                 let response = if let Message::ActionRequest { action, token: at } = msg {
                     if at.ct_eq(&token).unwrap_u8() == 0 {
                         warn!("Token didn't match.");
@@ -156,7 +156,9 @@ async fn main(_spawner: Spawner) -> ! {
                 };
 
                 let resp = response.unwrap_or(Response::FlashError);
-                let msg = Message::ActionResponse { response: resp };
+                let msg = Message::ActionResponse {
+                    response: resp.clone(),
+                };
                 if let Err(e) = send_message(&mut tx, msg, &key, &mut buf, &mut session_rng).await {
                     warn!("Failed to send message");
                     debug!("send message error: {}", e);
@@ -235,7 +237,7 @@ async fn main(_spawner: Spawner) -> ! {
         out_buf: &mut [u8],
     ) -> Result<Message, SendMessageError> {
         let enc_message = msg_receiver.recv_msg::<EncryptedMessage>().await?;
-        let dec = enc_message.decrypt_into(&key, out_buf)?;
+        let dec = enc_message.decrypt_into(key, out_buf)?;
         let msg = postcard::from_bytes::<Message>(dec)?;
         Ok(msg)
     }

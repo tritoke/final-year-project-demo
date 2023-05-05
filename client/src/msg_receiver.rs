@@ -1,8 +1,6 @@
-use crate::{K1, RECV_BUF_LEN};
-use aucpace::ServerMessage;
+use crate::RECV_BUF_LEN;
 use serde::Deserialize;
 use serialport::SerialPort;
-use std::sync::Mutex;
 use thiserror::Error;
 use tracing::{trace, warn};
 

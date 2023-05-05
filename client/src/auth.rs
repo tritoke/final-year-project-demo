@@ -1,17 +1,14 @@
 use crate::msg_receiver::MsgReceiver;
 use crate::Client;
 use anyhow::{anyhow, bail, Result};
-use aucpace::{AuCPaceClient, ServerMessage};
+use aucpace::ServerMessage;
 use chacha20poly1305::Key;
 use rand_core::OsRng;
 use scrypt::password_hash::ParamsString;
 use scrypt::{Params, Scrypt};
-use serialport::SerialPort;
-use sha3::Sha3_512;
-use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{info, trace};
 
 /// function like macro to wrap sending data over the serial port, returns the number of bytes sent
 macro_rules! send {
@@ -114,7 +111,7 @@ pub fn establish_key(
     let key = client
         .receive_server_authenticator(server_authenticator)
         .map_err(|e| anyhow!(e))?;
-    Ok(Key::from_slice(&key.as_slice()[..32]).clone())
+    Ok(*Key::from_slice(&key.as_slice()[..32]))
 }
 
 fn parse_params(ps: ParamsString) -> Result<Params> {

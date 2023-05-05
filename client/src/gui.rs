@@ -2,22 +2,18 @@ use crate::auth::register_user;
 use crate::metadata::Metadata;
 use crate::secret_key::SecretKey;
 use crate::utils::{compute_vault_key, decrypt_block, encrypt_block};
-use crate::{auth::establish_key, msg_receiver::MsgReceiver, Client, K1, USART_BAUD};
-use anyhow::Context;
+use crate::{auth::establish_key, msg_receiver::MsgReceiver, Client, USART_BAUD};
 use aucpace::AuCPaceClient;
-use chacha20poly1305::aead::Aead;
-use chacha20poly1305::{AeadCore, ChaCha20Poly1305, Key, KeyInit};
+use chacha20poly1305::Key;
 use eframe::egui;
 use egui::{Align, Layout, Pos2, Rect, RichText, Ui, Vec2, Visuals};
-use egui_extras::{Column, Table, TableBuilder};
+use egui_extras::{Column, TableBuilder};
 use egui_notify::Toasts;
 use rand_core::OsRng;
-use serialport::{SerialPort, SerialPortType};
+use serialport::SerialPortType;
 use shared::{Action, ActionToken, EncryptedMessage, Message, Response};
-use std::io::Write;
 use std::time::{Duration, Instant};
-use thiserror::Error;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, warn};
 
 const SERIAL_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_BACKOFF_TIME: Duration = Duration::from_millis(10);
@@ -107,10 +103,8 @@ impl eframe::App for Gui {
                 self.board_dropdown(ui);
 
                 ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
-                    if self.state == State::Homepage {
-                        if ui.button("Add Entry").clicked() {
-                            self.show_new_entry_window = true;
-                        }
+                    if self.state == State::Homepage && ui.button("Add Entry").clicked() {
+                        self.show_new_entry_window = true;
                     }
                     if self.state != State::Login {
                         if ui.button("Logout").clicked() {
@@ -322,7 +316,7 @@ impl Gui {
                         title.len() - 100
                     ));
                     return;
-                } else if title.len() == 0 {
+                } else if title.is_empty() {
                     self.notifications.warning("Entry title cannot be empty.");
                     return;
                 }
@@ -333,7 +327,7 @@ impl Gui {
                         user.len() - 60
                     ));
                     return;
-                } else if title.len() == 0 {
+                } else if user.is_empty() {
                     self.notifications
                         .warning("Entry username cannot be empty.");
                     return;
@@ -345,7 +339,7 @@ impl Gui {
                         pass.len() - 40
                     ));
                     return;
-                } else if pass.len() == 0 {
+                } else if pass.is_empty() {
                     self.notifications
                         .warning("Entry password cannot be empty.");
                     return;
@@ -487,7 +481,7 @@ impl Gui {
                         title.len() - 100
                     ));
                     return;
-                } else if title.len() == 0 {
+                } else if title.is_empty() {
                     self.notifications.warning("Entry title cannot be empty.");
                     return;
                 }
@@ -498,7 +492,7 @@ impl Gui {
                         user.len() - 60
                     ));
                     return;
-                } else if title.len() == 0 {
+                } else if user.is_empty() {
                     self.notifications
                         .warning("Entry username cannot be empty.");
                     return;
@@ -510,7 +504,7 @@ impl Gui {
                         pass.len() - 40
                     ));
                     return;
-                } else if pass.len() == 0 {
+                } else if pass.is_empty() {
                     self.notifications
                         .warning("Entry password cannot be empty.");
                     return;
@@ -598,7 +592,10 @@ impl Gui {
                 return;
             };
             if self.current_entry_user.is_empty() {
-                if let None = self.send_action_request(Action::Read { entry_idx }) {
+                if self
+                    .send_action_request(Action::Read { entry_idx })
+                    .is_none()
+                {
                     self.notifications.error("Failed to get the entry");
                     return;
                 };
@@ -675,7 +672,10 @@ impl Gui {
                     }
                     if ui.button("Delete").clicked() {
                         self.notifications.info("Delete");
-                        if let None = self.send_action_request(Action::Delete { entry_idx }) {
+                        if self
+                            .send_action_request(Action::Delete { entry_idx })
+                            .is_none()
+                        {
                             self.notifications.error("Failed to delete the entry.");
                             return;
                         }
@@ -771,8 +771,7 @@ impl Gui {
             }
             Err(e) => {
                 error!("Failed to establish shared key: {e:?}");
-                self.notifications
-                    .error(format!("Failed to establish shared key."));
+                self.notifications.error("Failed to establish shared key.");
                 return;
             }
         }
@@ -816,8 +815,8 @@ impl Gui {
         .ok();
 
         // generate a secret key
-        let mut sk = SecretKey::generate(&mut OsRng);
-        if let Err(_) = std::fs::write("demo.vault", format!("{sk}")) {
+        let sk = SecretKey::generate(&mut OsRng);
+        if std::fs::write("demo.vault", format!("{sk}")).is_err() {
             self.notifications
                 .error(
                     "Failed to write demo.vault, will be unable to add new entries to the vault.",

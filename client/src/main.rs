@@ -9,24 +9,15 @@ mod msg_receiver;
 mod secret_key;
 mod utils;
 
-use anyhow::{anyhow, bail, Result};
-use aucpace::{AuCPaceClient, ServerMessage};
-use clap::{Parser, Subcommand};
+use anyhow::Result;
+use aucpace::AuCPaceClient;
+use clap::Parser;
 use rand_core::OsRng;
-use scrypt::password_hash::ParamsString;
-use scrypt::{Params, Scrypt};
-use serialport::{SerialPort, SerialPortType};
+use scrypt::Scrypt;
 use sha3::Sha3_512;
-use std::io::{Read, Write};
-use std::sync::Mutex;
-use std::thread::AccessError;
-use std::time::Duration;
-use std::{io, thread};
+use std::io;
 
-use crate::auth::{establish_key, register_user};
 use crate::gui::Gui;
-use crate::msg_receiver::MsgReceiver;
-use shared::{Action, ActionToken, EncryptedMessage, Message, Response};
 #[allow(unused)]
 use tracing::{debug, error, info, trace, warn};
 use tracing_subscriber::fmt::writer::MakeWriterExt;

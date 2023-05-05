@@ -282,8 +282,8 @@ impl<'flash> Storage<'flash> {
         let cipher =
             ChaCha20Poly1305::new_from_slice(&DB_ENC_KEY).expect("length invariant broken");
         let (enc_data, tag_and_nonce) = buf.split_at_mut(228);
-        let nonce = GenericArray::from_slice(&tag_and_nonce[..12]).clone();
-        let tag = GenericArray::from_slice(&tag_and_nonce[12..]).clone();
+        let nonce = *GenericArray::from_slice(&tag_and_nonce[..12]);
+        let tag = *GenericArray::from_slice(&tag_and_nonce[12..]);
 
         if cipher
             .decrypt_in_place_detached(&nonce, b"", &mut enc_data[..228], &tag)
@@ -345,12 +345,12 @@ impl<'flash> Storage<'flash> {
         let mut write_idx = 0;
         for entry in 0..SectorMetadata::MAX_CELL {
             // ignore unpopulated entries
-            if !self.metadata.is_cell_populated(entry as u16) {
+            if !self.metadata.is_cell_populated(entry) {
                 continue;
             }
 
             let write_offset = new_sector.entry_offset(write_idx);
-            self.flash.blocking_write(write_offset, &mut buf)?;
+            self.flash.blocking_write(write_offset, &buf)?;
             write_idx += 1;
         }
 

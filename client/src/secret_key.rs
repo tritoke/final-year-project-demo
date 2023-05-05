@@ -1,5 +1,5 @@
 use anyhow::ensure;
-use rand_core::{CryptoRngCore, RngCore};
+use rand_core::CryptoRngCore;
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;

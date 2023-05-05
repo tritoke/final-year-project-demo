@@ -1,6 +1,6 @@
 use crate::secret_key::SecretKey;
 use chacha20poly1305::aead::Aead;
-use chacha20poly1305::{AeadCore, AeadInPlace, ChaCha20Poly1305, Key, KeyInit, Nonce};
+use chacha20poly1305::{AeadCore, ChaCha20Poly1305, Key, KeyInit, Nonce};
 use password_hash::{PasswordHasher, SaltString};
 use rand_core::OsRng;
 use scrypt::Scrypt;
@@ -10,7 +10,7 @@ pub fn compute_vault_key(password: &[u8], secret_key: SecretKey) -> password_has
     let hash = Scrypt.hash_password(password, &salt)?;
     let hash_bytes = hash.hash.expect("Scrypt failed to generate a hash???");
 
-    Ok(Key::from_slice(hash_bytes.as_bytes()).clone())
+    Ok(*Key::from_slice(hash_bytes.as_bytes()))
 }
 
 pub fn decrypt_block(block: [u8; 128], key: &Key) -> chacha20poly1305::aead::Result<[u8; 100]> {
@@ -18,7 +18,7 @@ pub fn decrypt_block(block: [u8; 128], key: &Key) -> chacha20poly1305::aead::Res
     let (data, nonce) = block.split_at(128 - 12);
     let nonce = Nonce::from_slice(nonce);
     cipher
-        .decrypt(&nonce, data)
+        .decrypt(nonce, data)
         .map(|v| v.as_slice().try_into().expect("length invariant broken"))
 }
 

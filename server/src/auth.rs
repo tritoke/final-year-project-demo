@@ -113,5 +113,5 @@ pub async fn establish_key(
     debug!("Sent Authenticator");
 
     // take the first 16 bytes of the hash as the key
-    Some(Key::from_slice(&key.as_slice()[..32]).clone())
+    Some(*Key::from_slice(&key.as_slice()[..32]))
 }

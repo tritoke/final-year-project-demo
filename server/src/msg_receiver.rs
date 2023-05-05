@@ -30,7 +30,7 @@ impl<'uart> MsgReceiver<'uart> {
         if self.reparse_message {
             self.reparse_message = false;
             if let Some(cde) = self.cobs_decode_end {
-                return postcard::from_bytes(&mut self.buf[..cde]);
+                return postcard::from_bytes(&self.buf[..cde]);
             }
         }
 
@@ -104,7 +104,7 @@ impl<'uart> MsgReceiver<'uart> {
         self.cobs_decode_end = Some(cde);
 
         // parse the result
-        postcard::from_bytes(&mut self.buf[..cde])
+        postcard::from_bytes(&self.buf[..cde])
     }
 
     pub fn unparse_last_message(&mut self) {

@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use subtle::{Choice, ConstantTimeEq};
 
 // present a CRUD interface to the client
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub enum Action {
     Create {
         #[serde(with = "serde_byte_array")]
@@ -37,7 +37,7 @@ pub enum Action {
 }
 
 /// used to grant an action - this prevents replay attacks
-#[derive(Serialize, Deserialize, Debug, Copy, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ActionToken(#[serde(with = "serde_byte_array")] [u8; 16]);
 
 impl ActionToken {
@@ -54,7 +54,7 @@ impl ConstantTimeEq for ActionToken {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum Response {
     Success,
     NewEntry {
@@ -77,7 +77,7 @@ pub enum Response {
     FlashError,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub enum Message {
     Token(ActionToken),
     ActionRequest { action: Action, token: ActionToken },
@@ -119,8 +119,8 @@ impl<'data> EncryptedMessage<'data> {
         out_buf: &'a mut [u8],
     ) -> Result<&'a mut [u8], chacha20poly1305::Error> {
         let cipher = ChaCha20Poly1305::new(key);
-        let nonce = GenericArray::from_slice(&self.nonce).clone();
-        let tag = GenericArray::from_slice(&self.tag).clone();
+        let nonce = *GenericArray::from_slice(&self.nonce);
+        let tag = *GenericArray::from_slice(&self.tag);
         if out_buf.len() < self.enc_data.len() {
             panic!("insufficient space to decrypt into buf");
         }
