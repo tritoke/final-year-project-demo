@@ -31,8 +31,7 @@ serde-byte-array = "0.1.2"
 thiserror = "1.0.40"
 
 [dependencies.aucpace]
-git = "https://github.com/RustCrypto/PAKEs"
-rev = "237b48d"
+version = "0.1.1"
 default-features = false
 features = [
     "scrypt",

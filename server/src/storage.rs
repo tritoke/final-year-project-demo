@@ -2,7 +2,7 @@ use crate::database::SingleUserDatabase;
 use crate::DB_ENC_KEY;
 use chacha20poly1305::{AeadCore, AeadInPlace, ChaCha20Poly1305, KeyInit};
 use core::mem;
-use embassy_stm32::flash::{Error as FlashError, Flash, MAX_ERASE_SIZE};
+use embassy_stm32::flash::{Error as FlashError, Flash, MAX_ERASE_SIZE, Blocking};
 use embassy_stm32::pac::FLASH_SIZE;
 use rand_core::CryptoRngCore;
 use sha3::digest::generic_array::GenericArray;
@@ -205,13 +205,13 @@ impl Sector {
 /// Sector two refers to the one before that: 262144..=393216
 pub struct Storage<'flash> {
     pub metadata: SectorMetadata,
-    pub flash: Flash<'flash>,
+    pub flash: Flash<'flash, Blocking>,
 }
 
 impl<'flash> Storage<'flash> {
-    pub fn new(mut flash: Flash<'flash>) -> StorageResult<Self> {
+    pub fn new(mut flash: Flash<'flash, Blocking>) -> StorageResult<Self> {
         let mut buf = [0u8; 4];
-        flash.blocking_read(FLASH_SIZE as u32 - 4, &mut buf)?;
+        flash.read(FLASH_SIZE as u32 - 4, &mut buf)?;
 
         let metadata = SectorMetadata::new();
         let mut storage = Self { metadata, flash };
@@ -227,10 +227,10 @@ impl<'flash> Storage<'flash> {
         const SECTOR_TWO_START: u32 = (FLASH_SIZE - 2 * MAX_ERASE_SIZE) as u32;
 
         let mut buf = [0u8; 256];
-        self.flash.blocking_read(SECTOR_ONE_START, &mut buf)?;
+        self.flash.read(SECTOR_ONE_START, &mut buf)?;
         let sector_one_erased = buf.iter().all(|x| *x == 0xFF);
 
-        self.flash.blocking_read(SECTOR_TWO_START, &mut buf)?;
+        self.flash.read(SECTOR_TWO_START, &mut buf)?;
         let sector_two_erased = buf.iter().all(|x| *x == 0xFF);
 
         // sector two is only active if sector one is erased and sector two isn't
@@ -248,7 +248,7 @@ impl<'flash> Storage<'flash> {
         let mut buf = [0u8; 256];
         for entry in 0..SectorMetadata::MAX_CELL {
             self.flash
-                .blocking_read(sector_base + 256 * entry as u32, &mut buf)?;
+                .read(sector_base + 256 * entry as u32, &mut buf)?;
 
             // we have hit the erased part of the sector, thus we can stop reading
             if buf.iter().all(|x| *x == 0xFF) {
@@ -277,7 +277,7 @@ impl<'flash> Storage<'flash> {
         let offset = self.metadata.active_sector().db_offset();
 
         let mut buf = [0u8; 256];
-        self.flash.blocking_read(offset, &mut buf)?;
+        self.flash.read(offset, &mut buf)?;
 
         let cipher =
             ChaCha20Poly1305::new_from_slice(&DB_ENC_KEY).expect("length invariant broken");
@@ -355,7 +355,7 @@ impl<'flash> Storage<'flash> {
         }
 
         // migrate the database across
-        self.flash.blocking_read(old_sector.db_offset(), &mut buf)?;
+        self.flash.read(old_sector.db_offset(), &mut buf)?;
         self.flash.blocking_write(new_sector.db_offset(), &buf)?;
 
         // maintain the one sector erased invariant
@@ -404,7 +404,7 @@ impl<'flash> Storage<'flash> {
         let sector = self.metadata.active_sector();
         let offset = sector.entry_offset(entry_idx);
         let mut buffer = [0u8; 256];
-        self.flash.blocking_read(offset, &mut buffer)?;
+        self.flash.read(offset, &mut buffer)?;
 
         Ok(Entry::deserialize(buffer))
     }
@@ -427,7 +427,7 @@ impl<'flash> Storage<'flash> {
         let sector = self.metadata.active_sector();
         let offset = sector.entry_offset(entry_idx) + 128;
         let mut buffer = [0u8; 128];
-        self.flash.blocking_read(offset, &mut buffer)?;
+        self.flash.read(offset, &mut buffer)?;
 
         Ok(buffer)
     }

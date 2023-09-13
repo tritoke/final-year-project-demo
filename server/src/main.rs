@@ -13,7 +13,7 @@ use auth::{establish_key, register_user};
 use chacha20poly1305::{AeadCore, AeadInPlace, ChaCha20Poly1305, Key, KeyInit};
 use defmt::*;
 use embassy_executor::Spawner;
-use embassy_stm32::interrupt;
+use embassy_stm32::{usart, peripherals, bind_interrupts};
 use embassy_stm32::time::Hertz;
 use embassy_stm32::usart::{Config, Uart, UartTx};
 use rand_chacha::ChaCha8Rng;
@@ -40,7 +40,11 @@ const BASE_SLEEP_MS: u32 = 10;
 // generated new each time the server is compiled
 const DB_ENC_KEY: [u8; 32] = const_random::const_random!([u8; 32]);
 
-#[cfg(not(test))]
+// its mine now >:)
+bind_interrupts!(struct Irqs {
+    USART2 => usart::InterruptHandler<peripherals::USART2>;
+});
+
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) -> ! {
     // make clock go brrr
@@ -54,9 +58,8 @@ async fn main(_spawner: Spawner) -> ! {
     // configure USART2 which goes over the USB port on this board
     let mut config = Config::default();
     config.baudrate = 28800;
-    let irq = interrupt::take!(USART2);
     let (mut tx, rx) =
-        Uart::new(p.USART2, p.PA3, p.PA2, irq, p.DMA1_CH6, p.DMA1_CH5, config).split();
+        Uart::new(p.USART2, p.PA3, p.PA2, Irqs, p.DMA1_CH6, p.DMA1_CH5, config).split();
     debug!("Configured USART2.");
 
     // configure the seed generator
@@ -64,7 +67,7 @@ async fn main(_spawner: Spawner) -> ! {
     debug!("Configured Seed generator.");
 
     // setup the flash storage manager
-    let mut storage = unwrap!(Storage::new(Flash::new(p.FLASH)));
+    let mut storage = unwrap!(Storage::new(Flash::new_blocking(p.FLASH)));
     debug!("Set up storage: metadata = {}", storage.metadata);
 
     // create the seed generator then seed a CSPRNG from it
