@@ -45,6 +45,7 @@ bind_interrupts!(struct Irqs {
     USART2 => usart::InterruptHandler<peripherals::USART2>;
 });
 
+#[cfg(not(test))]
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) -> ! {
     // make clock go brrr
